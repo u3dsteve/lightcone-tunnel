@@ -1,0 +1,18 @@
+# Lightcone Tunnel v1.2.0 - Client Configuration
+
+role: "client"                     # Node operation mode: "client" or "server"
+server_addr: "1.2.3.4:9999"        # Server domain or IPv4/IPv6 address with UDP port
+psk: "YourStrongSecretPSKKeyHere"  # Pre-shared key for ChaCha20-Poly1305 AEAD encryption
+
+# Local Ingress Proxy Settings
+socks_port: 1080                   # Local SOCKS5 proxy port (supports TCP & UDP Associate)
+http_port: 8080                    # Local HTTP/HTTPS CONNECT proxy port
+
+# RS-FEC (Reed-Solomon Forward Error Correction) Settings
+# Set both to 0 to disable FEC. Both client and server MUST use identical settings.
+fec_data_shards: 12                # Number of data shards (N)
+fec_parity_shards: 4               # Number of parity shards (M)
+
+# System Performance & Safety Limits
+max_concurrent_streams: 1024       # Limit for concurrent TCP streams and UDP sessions
+log_level: "info"                  # Log verbosity: "debug", "info", "warning", "error"

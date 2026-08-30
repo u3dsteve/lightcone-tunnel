@@ -1,0 +1,14 @@
+# Lightcone Tunnel v1.2.0 - Server Configuration
+
+role: "server"                     # Node operation mode: "client" or "server"
+server_addr: "0.0.0.0:9999"        # UDP listening host and port
+psk: "YourStrongSecretPSKKeyHere"  # Pre-shared key (must match client's PSK exactly)
+
+# RS-FEC (Reed-Solomon Forward Error Correction) Settings
+# Must match client settings for successful payload reconstruction.
+fec_data_shards: 12                # Number of data shards (N)
+fec_parity_shards: 4               # Number of parity shards (M)
+
+# System Performance & Safety Limits
+max_concurrent_streams: 1024       # Limit for concurrent outbound sockets and Full-Cone NAT entries
+log_level: "info"                  # Log verbosity: "debug", "info", "warning", "error"
