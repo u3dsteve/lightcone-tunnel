@@ -243,17 +243,6 @@ lightcone-tunnel/
 
 ---
 
-## Roadmap
-
-| Version | Feature | Status |
-| :--- | :--- | :--- |
-| v1.2.0 | RS-FEC Anti-Packet-Loss Engine | ✅ Released |
-| v1.4.4 | Cross-Platform GUI Manager | ✅ Released |
-| v1.5.0 | TUN Mode Support (VPN-like) | 🚧 Planned |
-| v1.6.0 | Multi-User PSK Management | 📋 Planned |
-
----
-
 ## Contributing
 
 Issues and pull requests are welcome. Please open an issue first to discuss your idea before submitting a PR.
