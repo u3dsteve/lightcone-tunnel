@@ -1,166 +1,149 @@
 # Lightcone Tunnel
 
-> **A single-file, cross-platform UDP tunnel with SOCKS5/HTTP proxy, RS-FEC anti-packet-loss engine, and full-cone NAT forwarding for unstable or censored networks.**
+> **Anti-DPI UDP Tunnel with SOCKS5/HTTP Proxy, RS-FEC Packet Loss Recovery, and Full-Cone NAT Forwarding**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)]()
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)](https://github.com/u3dsteve/lightcone-tunnel/releases)
+[![GitHub Stars](https://img.shields.io/github/stars/u3dsteve/lightcone-tunnel)](https://github.com/u3dsteve/lightcone-tunnel/stargazers)
+[![GitHub Issues](https://img.shields.io/github/issues/u3dsteve/lightcone-tunnel)](https://github.com/u3dsteve/lightcone-tunnel/issues)
 
+---
 
-## About
+## What is Lightcone Tunnel?
 
-**Lightcone Tunnel** is a single-file, cross-platform UDP tunnel that provides SOCKS5/HTTP proxy on the client side and full-cone NAT forwarding on the server side. It is designed for network environments where stability is poor or restrictions are present.
+**Lightcone Tunnel** is a single-file, cross-platform **UDP tunnel** that combines **SOCKS5/HTTP proxy** with **RS-FEC forward error correction** and **anti-DPI traffic obfuscation**. It is designed for network environments with **high packet loss**, **unstable connections**, or **deep packet inspection (DPI)** restrictions.
 
-Key features:
+**Key capabilities:**
 
-- **Anti-packet-loss**: RS-FEC (Reed-Solomon forward error correction) — with `(12,4)` configuration, recovers from up to 25% packet loss
-- **Anti-DPI**: No fixed magic bytes, random packet sizes (800–1200 bytes), Burst-mode jitter
-- **Secure**: ChaCha20-Poly1305 AEAD encryption with 64-bit anti-replay protection
-- **Cross-platform**: Windows / Linux with both GUI and CLI interfaces
-
-
-## What It Does
-
-| Role | Function |
+| Capability | Description |
 | :--- | :--- |
-| **Client** | Starts SOCKS5 (port 1080) and HTTP proxy (port 8080), receives traffic from browsers/applications, encrypts it, and forwards it to the server via UDP tunnel |
-| **Server** | Listens on UDP port, decrypts traffic, reconstructs streams, and forwards them to the target service (e.g., internal SSH, web server) |
+| **Anti-DPI Obfuscation** | No fixed magic bytes, randomized packet sizes (800–1200 bytes), Burst-mode jitter |
+| **RS-FEC Anti-Packet-Loss** | Reed-Solomon forward error correction with `(12,4)` configuration — recovers from up to 25% packet loss |
+| **ChaCha20-Poly1305 AEAD** | Authenticated encryption with 64-bit monotonic anti-replay protection |
+| **SOCKS5 / HTTP Proxy** | Full TCP CONNECT and UDP ASSOCIATE support with Full-Cone NAT forwarding |
+| **IPv4 / IPv6 Dual-Stack** | Seamless handling of both address families |
+| **DDNS Resilience** | Automatic background DNS refresh every 60 seconds |
+| **Cross-Platform GUI** | Windows and Linux desktop manager with multi-language support |
+| **Docker Ready** | Pre-built Docker image for server/CLI deployment |
 
-**Typical use cases:**
+---
 
-- Browser traffic routed through SOCKS5 proxy to bypass restrictions
-- Port forwarding over unreliable networks (similar to SSH forwarding but over UDP with FEC)
-- Remote access to SSH/RDP/web services
+## Why Lightcone Tunnel?
 
+### Compared to Other Solutions
+
+| Solution | Anti-DPI | FEC | SOCKS5/HTTP Proxy | Full-Cone NAT | GUI | Single-File |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Lightcone Tunnel** | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| tinyfecVPN | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| UDPspeeder | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Shadowsocks | ⚠️ | ❌ | ✅ | ❌ | ✅ | ❌ |
+| WireGuard | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ |
+| OpenVPN | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
+
+**What makes Lightcone Tunnel different:**
+
+- **Anti-DPI by design**, not as an afterthought — no protocol signatures, randomized packet sizing, Burst-mode jitter
+- **RS-FEC built into the tunnel** — recovers lost packets without application-layer retransmission
+- **Dual proxy modes** — SOCKS5 and HTTP in one binary
+- **Full-Cone NAT UDP forwarding** — supports UDP-dependent applications (VoIP, gaming)
+- **Cross-platform GUI** — non-technical users can manage the tunnel
+- **Single-file executable** — no complex installation
+
+---
+
+## Who Is This For?
+
+- **Network Engineers** — deploying tunnels in high-loss or DPI-restricted environments
+- **System Administrators** — setting up secure proxy gateways for internal networks
+- **DevOps Engineers** — integrating tunnels into CI/CD or containerized deployments
+- **Privacy-Conscious Users** — bypassing censorship with encrypted, obfuscated traffic
+- **Gamers / VoIP Users** — maintaining stable UDP connections over lossy links
+
+---
+
+## Quick Start
+
+### Option 1: Pre-built GUI (Recommended for End Users)
+
+Download the `LightconeManager` executable from the Releases page:
+
+```bash
+# Windows: Double-click LightconeManager.exe
+# Linux: chmod +x LightconeManager && ./LightconeManager
+```
+
+### Option 2: CLI Mode (Headless)
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Start as client
+python lightcone-tunnel.py config_client.yaml
+
+# Start as server
+python lightcone-tunnel.py config_server.yaml
+```
+
+### Option 3: Docker (Production-Ready)
+
+```bash
+# Build the image
+./build-docker.sh
+
+# Run client with default config
+docker run --rm -v $(pwd)/config_client.yaml:/app/config.yaml lightcone-tunnel:latest
+
+# Run server
+docker run --rm -v $(pwd)/config_server.yaml:/app/config.yaml lightcone-tunnel:latest /app/config.yaml
+```
+
+---
 
 ## Technical Overview
 
-**Encryption protocol (outer layer):**
+### Protocol Architecture
+
+```
+[Application] → SOCKS5/HTTP → [Client] → Encryption → FEC → UDP → [Server] → Decryption → [Target]
+```
+
+### Encryption Layer (Visible to DPI)
 
 ```
 [RandomPrefix 4B] [Seq 8B] [Timestamp 8B] [PadLen 1B] [Nonce 12B] [ChaCha20 Ciphertext]
 ```
 
-- No fixed magic bytes — eliminates signatures like `LCT1`
-- 64-bit sequence numbers — monotonic, never wrap
-- ChaCha20-Poly1305 AEAD authenticated encryption
+- **No fixed magic bytes** — no `LCT1` or other identifiable signatures
+- **64-bit sequence numbers** — monotonic, never wrap
+- **ChaCha20-Poly1305 AEAD** — authenticated encryption with integrity protection
 
-**FEC protocol (inside encrypted payload, invisible from outside):**
+### FEC Layer (Inside Encrypted Payload)
 
 ```
 [Group ID 8B] [ShardIdx 1B] [N 1B] [M 1B] [RawLen 2B] [Shard Data]
 ```
 
-- 64-bit Group ID — never wraps
-- Zero-latency delivery — uncorrupted shards are delivered immediately; FEC recovery only triggers when loss occurs
-- `zfec` C-extension accelerated; falls back to pure Python XOR when `zfec` is unavailable
+- **64-bit Group ID** — never wraps, supports indefinite 7×24 operation
+- **Zero-latency delivery** — uncorrupted shards delivered immediately
+- **zfec C-extension accelerated** — falls back to pure Python XOR when unavailable
 
-**Anti-DPI mechanisms:**
+### Anti-DPI Mechanisms
 
-- Packet sizes randomized between 800–1200 bytes — no fixed pattern
-- Burst Mode: micro-sleep (0.1–0.3ms) every 12 packets — breaks timing patterns
+| Mechanism | Description |
+| :--- | :--- |
+| **No Magic Bytes** | First 4 bytes randomized per packet |
+| **Dynamic Payload Sizing** | 800–1200 bytes random chunk size |
+| **Burst-Mode Jitter** | 0.1–0.3ms micro-sleep every 12 packets |
+| **Dynamic Padding** | 0–15 random bytes appended to each datagram |
 
+---
 
-## Deployment
+## Configuration
 
-### Option 1: Pre-built GUI (Recommended)
-
-Download the `LightconeManager` executable for your platform from the Releases page and double-click to run.
-
-- **Windows**: `LightconeManager.exe`
-- **Linux**: `LightconeManager` (set executable: `chmod +x`)
-
-**Using the GUI:**
-
-1. First launch automatically creates `configs/default_client.yaml`
-2. Edit configuration (server address, PSK, FEC parameters, etc.), click Save
-3. Click **Start Engine**
-
-Configurations are stored in `configs/` directory — you can switch between multiple profiles.
-
-### Option 2: CLI Mode (Headless)
-
-**Install dependencies first**
-
-```bash
-pip install -r requirements.txt
-```
-
-**Start the client:**
-
-```bash
-python lightcone-tunnel.py config_client.yaml
-```
-
-**Start the server:**
-
-```bash
-python lightcone-tunnel.py config_server.yaml
-```
-
-### Option 3: Docker Deployment
-
-**Dockerfile:**
-
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-RUN pip install --no-cache-dir cryptography pyyaml zfec
-
-COPY lightcone-tunnel.py /app/lightcone-tunnel.py
-
-ENTRYPOINT ["python3", "/app/lightcone-tunnel.py"]
-```
-
-**docker-compose.yml:**
-
-```yaml
-services:
-  lightcone-server:
-    build: .
-    container_name: lightcone-server
-    restart: always
-    network_mode: host
-    volumes:
-      - ./config_server.yaml:/app/config.yaml:ro
-    command: ["/app/config.yaml"]
-    deploy:
-      resources:
-        limits:
-          memory: 512M
-
-  lightcone-client:
-    build: .
-    container_name: lightcone-client
-    restart: always
-    network_mode: host
-    volumes:
-      - ./config_client.yaml:/app/config.yaml:ro
-    command: ["/app/config.yaml"]
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-```
-
-**Run services:**
-
-```bash
-# Build and run server
-docker compose up -d --build lightcone-server
-
-# Build and run client
-docker compose up -d --build lightcone-client
-
-# View logs
-docker compose logs -f
-```
-
-### Configuration Examples
-
-**Client (`config_client.yaml`):**
+### Client Configuration (`config_client.yaml`)
 
 ```yaml
 role: "client"
@@ -174,7 +157,7 @@ max_concurrent_streams: 1024
 log_level: "info"
 ```
 
-**Server (`config_server.yaml`):**
+### Server Configuration (`config_server.yaml`)
 
 ```yaml
 role: "server"
@@ -186,58 +169,96 @@ max_concurrent_streams: 1024
 log_level: "info"
 ```
 
-### Verification
+### FEC Parameter Tuning
+
+| Configuration | Overhead | Loss Tolerance | Use Case |
+| :--- | :--- | :--- | :--- |
+| `(0, 0)` | 0% | 0% | Clean networks (FEC disabled) |
+| `(8, 2)` | ~25% | ~20% | Moderate packet loss |
+| `(12, 4)` | ~33% | ~25% | High packet loss (default) |
+| `(16, 4)` | ~25% | ~20% | Very high throughput |
+
+---
+
+## Verification
 
 ```bash
-# Test SOCKS5
+# Test SOCKS5 proxy
 curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
 
 # Test HTTP proxy
 curl -x http://127.0.0.1:8080 https://ifconfig.me
+
+# Check server UDP binding
+ss -ulpn | grep 8443
 ```
 
+---
 
 ## Building from Source
 
-### Install Dependencies
+### Clone and Install Dependencies
 
 ```bash
-# Clone repository
 git clone https://github.com/u3dsteve/lightcone-tunnel
 cd lightcone-tunnel
-
-# Create virtual environment (recommended)
 python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-
-# Install core dependencies
+source venv/bin/activate
 pip install -r requirements.txt
-
-# Install GUI dependencies (if building GUI)
-pip install -r requirements-gui.txt
-
-# Install packaging tool
-pip install pyinstaller
 ```
 
-### Package Executables
-
-**Automatic build (detects current platform):**
+### Package Executables (GUI)
 
 ```bash
+pip install pyinstaller
 python build.py
 
-# Outputs:
-# Windows: dist/LightconeManager.exe
-# Linux:   dist/LightconeManager
+# Output: dist/LightconeManager.exe (Windows) or dist/LightconeManager (Linux)
 ```
+
+### Docker Image
+
+```bash
+./build-docker.sh
+```
+
+---
+
+## Project Structure
+
+```
+lightcone-tunnel/
+├── lightcone-tunnel.py          # Core tunnel engine (CLI)
+├── lightcone-manager.py         # GUI management application
+├── build.py                     # PyInstaller packaging script
+├── build-docker.sh              # Docker image builder
+├── Dockerfile                   # Docker build definition
+├── docker-compose.yaml          # Docker Compose configuration
+├── config_client.yaml           # Client configuration template
+├── config_server.yaml           # Server configuration template
+├── requirements.txt             # Core dependencies
+├── requirements-gui.txt         # GUI dependencies
+└── configs/                     # User configuration storage (auto-created)
+```
+
+---
+
+## Roadmap
+
+| Version | Feature | Status |
+| :--- | :--- | :--- |
+| v1.2.0 | RS-FEC Anti-Packet-Loss Engine | ✅ Released |
+| v1.4.4 | Cross-Platform GUI Manager | ✅ Released |
+| v1.5.0 | TUN Mode Support (VPN-like) | 🚧 Planned |
+| v1.6.0 | Multi-User PSK Management | 📋 Planned |
+
+---
 
 ## Contributing
 
 Issues and pull requests are welcome. Please open an issue first to discuss your idea before submitting a PR.
 
 **Code guidelines:**
-
 - Core tunnel logic stays in `lightcone-tunnel.py` (single-file)
 - GUI logic in `lightcone-manager.py`
 - Configuration fields follow `config_client.yaml` / `config_server.yaml`
@@ -253,3 +274,37 @@ source venv/bin/activate
 pip install -r requirements-gui.txt
 pip install pyinstaller
 ```
+
+---
+
+## License
+
+MIT License — see [LICENSE](LICENSE) file for details.
+
+---
+
+## Related Projects
+
+- [Tunnel Agent](https://github.com/u3dsteve/tunnel-agent) — Lightweight TCP-over-UDP forwarder with RS-FEC
+- [tinyfecVPN](https://github.com/wangyu-/tinyfecVPN) — VPN with FEC for lossy links
+- [UDPspeeder](https://github.com/wangyu-/UDPspeeder) — UDP tunnel with FEC
+
+---
+
+## Keywords
+
+```
+udp-tunnel, anti-dpi, socks5-proxy, http-proxy, fec, forward-error-correction, reed-solomon, chacha20-poly1305, anti-replay, full-cone-nat, python, asyncio, network-tunnel, obfuscation, security, encryption, ddns, cross-platform, gui, docker
+```
+
+---
+
+## Why Open Source?
+
+Lightcone Tunnel was built by network engineers who needed a reliable tunnel for high-loss, DPI-restricted environments. We're open-sourcing it because we believe the tools that make our networks more resilient should be available to everyone.
+
+If you've ever struggled with packet loss, DPI blocking, or rebuilding your network configuration from scratch — this is for you.
+
+---
+
+*Built by network engineers, for network engineers.*
