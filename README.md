@@ -253,5 +253,3 @@ source venv/bin/activate
 pip install -r requirements-gui.txt
 pip install pyinstaller
 ```
-
-**License**: MIT
