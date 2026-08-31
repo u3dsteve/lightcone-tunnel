@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Lightcone Tunnel GUI Manager v1.2.0 (Boundary Fortified)
+Lightcone Tunnel GUI Manager v1.2.4 (i18n Exit Notice Fix)
 Built with NiceGUI for Cross-Platform Desktop Management
 """
 
 import asyncio
 import importlib.util
+import multiprocessing
 import os
 import re
 import sys
@@ -15,8 +16,10 @@ from typing import Dict, Any, Optional
 import yaml
 
 # ============================================================================
-# PyInstaller Safe Worker Entry Point Guard
+# PyInstaller Multi-processing Guard & Worker Entry Point
 # ============================================================================
+multiprocessing.freeze_support()
+
 if "--worker" in sys.argv:
     search_dirs = [os.path.dirname(os.path.abspath(sys.argv[0]))]
     if hasattr(sys, '_MEIPASS'):
@@ -51,6 +54,24 @@ if "--worker" in sys.argv:
         print(f"Error executing worker module: {e}")
         sys.exit(1)
 
+# ----------------------------------------------------------------------------
+# Single Instance Lock
+# ----------------------------------------------------------------------------
+def acquire_single_instance_lock():
+    lock_file = Path("/tmp/lightcone_manager.lock")
+    try:
+        fp = open(lock_file, "w")
+        import fcntl
+        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fp
+    except (IOError, OSError):
+        print("[Error] Another instance of Lightcone Manager is already running on this machine.")
+        sys.exit(1)
+    except ImportError:
+        return None
+
+_instance_lock = acquire_single_instance_lock()
+
 from nicegui import ui, app
 
 # ============================================================================
@@ -63,6 +84,9 @@ I18N = {
         "add_config": "Add Config",
         "start": "Start Engine",
         "stop": "Stop Engine",
+        "exit_app": "Exit App",
+        "confirm_exit": "Are you sure you want to close the application?",
+        "exit_notice": "Application closed. Please run again if needed.",
         "status_running": "RUNNING",
         "status_stopped": "STOPPED",
         "tab_config": "Configuration",
@@ -99,6 +123,9 @@ I18N = {
         "add_config": "新建配置",
         "start": "启动隧道",
         "stop": "停止隧道",
+        "exit_app": "关闭程序",
+        "confirm_exit": "确定要关闭程序吗？",
+        "exit_notice": "程序已关闭，若需要请再次运行。",
         "status_running": "运行中",
         "status_stopped": "已停止",
         "tab_config": "配置参数",
@@ -135,6 +162,9 @@ I18N = {
         "add_config": "新建設定",
         "start": "啟動隧道",
         "stop": "停止隧道",
+        "exit_app": "關閉程式",
+        "confirm_exit": "確定要關閉程式嗎？",
+        "exit_notice": "程式已關閉，若需要請再次運行。",
         "status_running": "運行中",
         "status_stopped": "已停止",
         "tab_config": "設定參數",
@@ -194,8 +224,6 @@ class TunnelAppState:
         self.process: Optional[asyncio.subprocess.Process] = None
         self.log_widget: Optional[ui.log] = None
         self.log_buffer = []
-        self.render_config_list = lambda: None
-        self.render_config_form = lambda: None
         self.load_configs()
 
     def t(self, key: str) -> str:
@@ -290,20 +318,22 @@ async def start_tunnel_engine():
 
 
 async def read_process_output():
-    if not state.process or not state.process.stdout:
+    proc = state.process
+    if not proc or not proc.stdout:
         return
 
-    while state.process and state.process.returncode is None:
-        line = await state.process.stdout.readline()
+    while proc.returncode is None:
+        line = await proc.stdout.readline()
         if not line:
             break
         text = line.decode('utf-8', errors='ignore').rstrip()
         if text:
             state.append_log(text)
 
-    await state.process.wait()
-    state.append_log(f"[Manager] Engine stopped with exit code: {state.process.returncode}")
-    state.process = None
+    await proc.wait()
+    state.append_log(f"[Manager] Engine stopped with exit code: {proc.returncode}")
+    if state.process == proc:
+        state.process = None
     ui.update()
 
 
@@ -325,14 +355,148 @@ async def stop_tunnel_engine():
         ui.update()
 
 
+async def exit_application():
+    await stop_tunnel_engine()
+    notice = state.t("exit_notice")
+    ui.run_javascript(f'''
+        document.body.style.backgroundColor = "white";
+        document.body.innerHTML = "<div style='display: flex; justify-content: center; align-items: center; height: 100vh; font-size: 20px; color: #333; font-family: sans-serif; font-weight: bold;'>{notice}</div>";
+    ''')
+    await asyncio.sleep(0.5)
+    os._exit(0)
+
+
 # ============================================================================
-# GUI Layout & Responsive Rendering
+# Dynamic Refreshable UI Components
+# ============================================================================
+@ui.refreshable
+def render_config_list():
+    for cfg_name in list(state.configs.keys()):
+        is_active = (cfg_name == state.active_config_name)
+        
+        with ui.row().classes(f'w-full items-center justify-between p-2 rounded cursor-pointer transition-colors {"bg-blue-50 dark:bg-slate-800" if is_active else "hover:bg-slate-200 dark:hover:bg-slate-800"}'):
+            ui.label(cfg_name).classes('font-medium text-sm truncate max-w-[140px]') \
+                .on('click', lambda _, name=cfg_name: select_config(name))
+            
+            with ui.row().classes('items-center gap-1'):
+                if len(state.configs) > 1:
+                    ui.button(icon='delete', on_click=lambda _, name=cfg_name: confirm_delete_config(name)) \
+                        .props('flat round dense size=sm color=negative')
+
+
+@ui.refreshable
+def render_config_form():
+    cfg = state.configs.get(state.active_config_name, DEFAULT_CLIENT_CONFIG.copy())
+
+    ui.label().bind_text_from(state, 'active_config_name', lambda n: f"Config: {n}").classes('text-xl font-bold mb-2')
+
+    with ui.grid(columns=2).classes('w-full gap-4'):
+        role_select = ui.select(
+            options=["client", "server"],
+            value=cfg.get("role", "client"),
+            label=state.t("role")
+        ).classes('w-full').props('outlined')
+
+        server_addr_input = ui.input(
+            label=state.t("server_addr"),
+            value=cfg.get("server_addr", "127.0.0.1:8443")
+        ).classes('w-full').props('outlined')
+
+        psk_input = ui.input(
+            label=state.t("psk"),
+            value=cfg.get("psk", ""),
+            password=True,
+            password_toggle_button=True
+        ).classes('w-full').props('outlined')
+
+        socks_port_input = ui.number(
+            label=state.t("socks_port"),
+            value=cfg.get("socks_port", 1080),
+            format='%d'
+        ).classes('w-full').props('outlined')
+
+        http_port_input = ui.number(
+            label=state.t("http_port"),
+            value=cfg.get("http_port", 8080),
+            format='%d'
+        ).classes('w-full').props('outlined')
+
+        fec_enabled_init = cfg.get("fec_data_shards", 0) > 0 and cfg.get("fec_parity_shards", 0) > 0
+        fec_switch = ui.switch(
+            text=state.t("fec_enable"),
+            value=fec_enabled_init
+        ).classes('col-span-2 font-medium')
+
+        fec_n_input = ui.number(
+            label=state.t("fec_n"),
+            value=cfg.get("fec_data_shards", 12) if fec_enabled_init else 12,
+            format='%d'
+        ).classes('w-full').props('outlined')
+
+        fec_m_input = ui.number(
+            label=state.t("fec_m"),
+            value=cfg.get("fec_parity_shards", 4) if fec_enabled_init else 4,
+            format='%d'
+        ).classes('w-full').props('outlined')
+
+        max_streams_input = ui.number(
+            label=state.t("max_streams"),
+            value=cfg.get("max_concurrent_streams", 1024),
+            format='%d'
+        ).classes('w-full').props('outlined')
+
+        log_level_select = ui.select(
+            options=["debug", "info", "warning", "error"],
+            value=cfg.get("log_level", "info"),
+            label=state.t("log_level")
+        ).classes('w-full').props('outlined')
+
+    def handle_role_change(e):
+        is_client = (e.value == "client")
+        socks_port_input.set_visibility(is_client)
+        http_port_input.set_visibility(is_client)
+
+    def handle_fec_toggle(e):
+        fec_n_input.set_visibility(e.value)
+        fec_m_input.set_visibility(e.value)
+
+    role_select.on_value_change(handle_role_change)
+    handle_role_change(type('Ev', (), {'value': role_select.value}))
+
+    fec_switch.on_value_change(handle_fec_toggle)
+    handle_fec_toggle(type('Ev', (), {'value': fec_switch.value}))
+
+    def save_action():
+        updated_cfg = {
+            "role": role_select.value,
+            "server_addr": server_addr_input.value,
+            "psk": psk_input.value,
+            "fec_data_shards": int(fec_n_input.value or 0) if fec_switch.value else 0,
+            "fec_parity_shards": int(fec_m_input.value or 0) if fec_switch.value else 0,
+            "max_concurrent_streams": int(max_streams_input.value or 1024),
+            "log_level": log_level_select.value,
+        }
+        if role_select.value == "client":
+            updated_cfg["socks_port"] = int(socks_port_input.value or 1080)
+            updated_cfg["http_port"] = int(http_port_input.value or 8080)
+
+        state.configs[state.active_config_name] = updated_cfg
+        state.save_config_file(state.active_config_name, updated_cfg)
+        ui.notify(state.t("msg_saved"), type='positive')
+
+    ui.button(icon='save', on_click=save_action) \
+        .bind_text_from(state, 'lang', lambda _: state.t('save')) \
+        .props('color=primary unelevated').classes('mt-4')
+
+
+# ============================================================================
+# GUI Layout & Actions
 # ============================================================================
 @ui.page('/')
 def main_page():
     ui.colors(primary='#2563EB', secondary='#475569', accent='#10B981')
 
-    # Top Header
+    # Header
     with ui.header().classes('items-center justify-between bg-slate-800 text-white px-6 py-3'):
         with ui.row().classes('items-center gap-3'):
             ui.icon('lan', size='md').classes('text-blue-400')
@@ -346,9 +510,8 @@ def main_page():
         with ui.row().classes('items-center gap-4'):
             def on_lang_change(e):
                 state.lang = e.value
-                state.render_config_list()
-                state.render_config_form()
-                ui.update()
+                render_config_list.refresh()
+                render_config_form.refresh()
 
             ui.select(
                 options={"en": "English", "zh-CN": "简体中文", "zh-TW": "繁體中文"},
@@ -372,7 +535,14 @@ def main_page():
              .bind_visibility_from(state, 'is_running') \
              .props('color=rose unelevated')
 
-    # Main Body
+            ui.button(
+                text="",
+                icon="power_settings_new",
+                on_click=confirm_exit_app
+            ).bind_text_from(state, 'lang', lambda _: state.t('exit_app')) \
+             .props('color=grey-8 unelevated')
+
+    # Main Grid
     with ui.row().classes('w-full h-[calc(100vh-65px)] no-wrap gap-0'):
         # Drawer
         with ui.column().classes('w-72 bg-slate-100 dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 p-4 gap-2 h-full'):
@@ -380,25 +550,8 @@ def main_page():
                 ui.label().bind_text_from(state, 'lang', lambda _: state.t('configs')).classes('font-semibold text-slate-700 dark:text-slate-300')
                 ui.button(icon='add', on_click=open_add_config_dialog).props('flat round dense color=primary')
 
-            config_list_container = ui.column().classes('w-full gap-1 overflow-y-auto flex-grow')
-
-            def render_config_list():
-                config_list_container.clear()
-                with config_list_container:
-                    for cfg_name in list(state.configs.keys()):
-                        is_active = (cfg_name == state.active_config_name)
-                        
-                        with ui.row().classes(f'w-full items-center justify-between p-2 rounded cursor-pointer transition-colors {"bg-blue-50 dark:bg-slate-800" if is_active else "hover:bg-slate-200 dark:hover:bg-slate-800"}'):
-                            ui.label(cfg_name).classes('font-medium text-sm truncate max-w-[140px]') \
-                                .on('click', lambda _, name=cfg_name: select_config(name))
-                            
-                            with ui.row().classes('items-center gap-1'):
-                                if len(state.configs) > 1:
-                                    ui.button(icon='delete', on_click=lambda _, name=cfg_name: confirm_delete_config(name)) \
-                                        .props('flat round dense size=sm color=negative')
-
-            state.render_config_list = render_config_list
-            render_config_list()
+            with ui.column().classes('w-full gap-1 overflow-y-auto flex-grow'):
+                render_config_list()
 
         # Content Area
         with ui.column().classes('flex-grow h-full p-6 bg-white dark:bg-slate-950 overflow-y-auto'):
@@ -409,11 +562,8 @@ def main_page():
             with ui.tab_panels(tabs, value=tab_config).classes('w-full mt-4 flex-grow'):
                 # Config Panel
                 with ui.tab_panel(tab_config):
-                    config_form_container = ui.column().classes('w-full max-w-3xl gap-4')
-                    def build_form():
-                        render_config_form(config_form_container)
-                    state.render_config_form = build_form
-                    build_form()
+                    with ui.column().classes('w-full max-w-3xl gap-4'):
+                        render_config_form()
 
                 # Logs Panel
                 with ui.tab_panel(tab_logs):
@@ -437,9 +587,8 @@ def select_config(name: str):
         ui.notify("Stop the tunnel before changing active config.", type='warning')
         return
     state.active_config_name = name
-    state.render_config_list()
-    state.render_config_form()
-    ui.update()
+    render_config_list.refresh()
+    render_config_form.refresh()
 
 
 def clear_logs_action():
@@ -456,118 +605,13 @@ def export_logs_action():
     ui.download(content.encode('utf-8'), "lightcone_export.log")
 
 
-def render_config_form(container):
-    container.clear()
-    cfg = state.configs.get(state.active_config_name, DEFAULT_CLIENT_CONFIG.copy())
-
-    with container:
-        ui.label().bind_text_from(state, 'active_config_name', lambda n: f"Config: {n}").classes('text-xl font-bold mb-2')
-
-        with ui.grid(columns=2).classes('w-full gap-4'):
-            role_select = ui.select(
-                options=["client", "server"],
-                value=cfg.get("role", "client"),
-                label=state.t("role")
-            ).classes('w-full').props('outlined')
-
-            server_addr_input = ui.input(
-                label=state.t("server_addr"),
-                value=cfg.get("server_addr", "127.0.0.1:8443")
-            ).classes('w-full').props('outlined')
-
-            psk_input = ui.input(
-                label=state.t("psk"),
-                value=cfg.get("psk", ""),
-                password=True,
-                password_toggle_button=True
-            ).classes('w-full').props('outlined')
-
-            socks_port_input = ui.number(
-                label=state.t("socks_port"),
-                value=cfg.get("socks_port", 1080),
-                format='%d'
-            ).classes('w-full').props('outlined')
-
-            http_port_input = ui.number(
-                label=state.t("http_port"),
-                value=cfg.get("http_port", 8080),
-                format='%d'
-            ).classes('w-full').props('outlined')
-
-            fec_enabled_init = cfg.get("fec_data_shards", 0) > 0 and cfg.get("fec_parity_shards", 0) > 0
-            fec_switch = ui.switch(
-                text=state.t("fec_enable"),
-                value=fec_enabled_init
-            ).classes('col-span-2 font-medium')
-
-            fec_n_input = ui.number(
-                label=state.t("fec_n"),
-                value=cfg.get("fec_data_shards", 12) if fec_enabled_init else 12,
-                format='%d'
-            ).classes('w-full').props('outlined')
-
-            fec_m_input = ui.number(
-                label=state.t("fec_m"),
-                value=cfg.get("fec_parity_shards", 4) if fec_enabled_init else 4,
-                format='%d'
-            ).classes('w-full').props('outlined')
-
-            max_streams_input = ui.number(
-                label=state.t("max_streams"),
-                value=cfg.get("max_concurrent_streams", 1024),
-                format='%d'
-            ).classes('w-full').props('outlined')
-
-            log_level_select = ui.select(
-                options=["debug", "info", "warning", "error"],
-                value=cfg.get("log_level", "info"),
-                label=state.t("log_level")
-            ).classes('w-full').props('outlined')
-
-        def handle_role_change(e):
-            is_client = (e.value == "client")
-            socks_port_input.set_visibility(is_client)
-            http_port_input.set_visibility(is_client)
-
-        def handle_fec_toggle(e):
-            fec_n_input.set_visibility(e.value)
-            fec_m_input.set_visibility(e.value)
-
-        role_select.on_value_change(handle_role_change)
-        handle_role_change(type('Ev', (), {'value': role_select.value}))
-
-        fec_switch.on_value_change(handle_fec_toggle)
-        handle_fec_toggle(type('Ev', (), {'value': fec_switch.value}))
-
-        def save_action():
-            updated_cfg = {
-                "role": role_select.value,
-                "server_addr": server_addr_input.value,
-                "psk": psk_input.value,
-                "fec_data_shards": int(fec_n_input.value or 0) if fec_switch.value else 0,
-                "fec_parity_shards": int(fec_m_input.value or 0) if fec_switch.value else 0,
-                "max_concurrent_streams": int(max_streams_input.value or 1024),
-                "log_level": log_level_select.value,
-            }
-            if role_select.value == "client":
-                updated_cfg["socks_port"] = int(socks_port_input.value or 1080)
-                updated_cfg["http_port"] = int(http_port_input.value or 8080)
-
-            state.configs[state.active_config_name] = updated_cfg
-            state.save_config_file(state.active_config_name, updated_cfg)
-            ui.notify(state.t("msg_saved"), type='positive')
-
-        ui.button(icon='save', on_click=save_action) \
-            .bind_text_from(state, 'lang', lambda _: state.t('save')) \
-            .props('color=primary unelevated').classes('mt-4')
-
-
 def open_add_config_dialog():
     if len(state.configs) >= 10:
         ui.notify(state.t("err_max_configs"), type='warning')
         return
 
-    with ui.dialog() as dialog, ui.card().classes('w-96 p-4 gap-4'):
+    dialog = ui.dialog()
+    with dialog, ui.card().classes('w-96 p-4 gap-4'):
         ui.label(state.t("add_config")).classes('text-lg font-bold')
         name_input = ui.input(label=state.t("dialog_name_placeholder")).classes('w-full').props('outlined')
 
@@ -589,10 +633,9 @@ def open_add_config_dialog():
                 state.configs[val] = DEFAULT_CLIENT_CONFIG.copy()
                 state.save_config_file(val, DEFAULT_CLIENT_CONFIG)
                 state.active_config_name = val
-                state.render_config_list()
-                state.render_config_form()
+                render_config_list.refresh()
+                render_config_form.refresh()
                 dialog.close()
-                ui.update()
 
             ui.button(state.t('create'), on_click=create_config).props('unelevated color=primary')
 
@@ -604,36 +647,53 @@ def confirm_delete_config(name: str):
         ui.notify(state.t("err_delete_running"), type='warning')
         return
 
-    with ui.dialog() as dialog, ui.card().classes('p-4 gap-4'):
+    dialog = ui.dialog()
+    with dialog, ui.card().classes('p-4 gap-4'):
         ui.label(state.t("confirm_delete")).classes('text-base')
         with ui.row().classes('w-full justify-end gap-2'):
             ui.button(state.t('cancel'), on_click=dialog.close).props('flat')
             
             def do_delete():
+                dialog.close()
                 state.delete_config_file(name)
                 state.configs.pop(name, None)
                 if state.active_config_name == name:
-                    state.active_config_name = next(iter(state.configs.keys()))
-                state.render_config_list()
-                state.render_config_form()
-                dialog.close()
+                    state.active_config_name = next(iter(state.configs.keys()), "")
+                render_config_list.refresh()
+                render_config_form.refresh()
                 ui.notify(state.t("msg_deleted"), type='info')
-                ui.update()
 
             ui.button(state.t('delete'), on_click=do_delete).props('unelevated color=negative')
 
     dialog.open()
 
 
+def confirm_exit_app():
+    dialog = ui.dialog()
+    with dialog, ui.card().classes('p-4 gap-4'):
+        ui.label(state.t("confirm_exit")).classes('text-base')
+        with ui.row().classes('w-full justify-end gap-2'):
+            ui.button(state.t('cancel'), on_click=dialog.close).props('flat')
+            
+            async def do_exit():
+                dialog.close()
+                await exit_application()
+
+            ui.button(state.t('exit_app'), on_click=do_exit).props('unelevated color=negative')
+
+    dialog.open()
+
+
 # ============================================================================
-# Application Entry Point
+# Application Entry Point (Browser Mode)
 # ============================================================================
 if __name__ in {"__main__", "__mp_main__"}:
     app.on_shutdown(stop_tunnel_engine)
+
     ui.run(
         title="Lightcone Tunnel Manager",
         port=8000,
         reload=False,
         show=True,
-        window_size=(1024, 720)
+        native=False,
     )

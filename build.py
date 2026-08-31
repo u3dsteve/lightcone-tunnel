@@ -31,20 +31,31 @@ def clean():
         f.unlink()
 
 # ============================================================================
-# Windows Packaging
+# PyInstaller Command Generator
 # ============================================================================
-def build_windows():
-    print("📦 Building Windows executable...")
-    cmd = [
+def get_base_cmd():
+    return [
         sys.executable, "-m", "PyInstaller",
         "--onefile",
         "--windowed",
         "--name", APP_NAME,
+        "--collect-all", "nicegui",
         "--add-data", f"lightcone-tunnel.py{os.pathsep}.",
+        "--hidden-import", "cryptography",
+        "--hidden-import", "cryptography.hazmat.primitives.ciphers.aead",
+        "--hidden-import", "zfec",
         MAIN_SCRIPT
     ]
+
+# ============================================================================
+# Windows Packaging
+# ============================================================================
+def build_windows():
+    print("📦 Building Windows executable...")
+    cmd = get_base_cmd()
     if os.path.exists(ICON_FILE):
-        cmd.extend(["--icon", ICON_FILE])
+        cmd.insert(-1, "--icon")
+        cmd.insert(-1, ICON_FILE)
 
     subprocess.run(cmd, check=True)
     print(f"✅ Windows executable: {OUTPUT_DIR}/{APP_NAME}.exe")
@@ -54,14 +65,7 @@ def build_windows():
 # ============================================================================
 def build_linux():
     print("📦 Building Linux executable...")
-    cmd = [
-        sys.executable, "-m", "PyInstaller",
-        "--onefile",
-        "--windowed",  # 抑制终端窗口，提供桌面应用体验
-        "--name", APP_NAME,
-        "--add-data", f"lightcone-tunnel.py{os.pathsep}.",
-        MAIN_SCRIPT
-    ]
+    cmd = get_base_cmd()
     subprocess.run(cmd, check=True)
     print(f"✅ Linux executable: {OUTPUT_DIR}/{APP_NAME}")
 
@@ -69,7 +73,6 @@ def build_linux():
 # Main Entry Point
 # ============================================================================
 if __name__ == "__main__":
-    # Check dependencies
     try:
         import PyInstaller
     except ImportError:
