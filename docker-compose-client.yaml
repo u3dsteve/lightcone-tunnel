@@ -1,0 +1,13 @@
+services:
+  lightcone-client:
+    image: lightcone-tunnel:latest
+    container_name: lightcone-client
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config_client.yaml:/app/config.yaml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: '0.5'
