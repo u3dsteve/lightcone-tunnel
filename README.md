@@ -80,6 +80,12 @@ Configurations are stored in `configs/` directory — you can switch between mul
 
 ### Option 2: CLI Mode (Headless)
 
+**Install dependencies first**
+
+```bash
+pip install -r requirements.txt
+```
+
 **Start the client:**
 
 ```bash
@@ -226,31 +232,6 @@ python build.py
 # Linux:   dist/LightconeManager
 ```
 
-**Manual build commands:**
-
-Windows:
-```bash
-pyinstaller --onefile --windowed --name LightconeManager \
-    --add-data "lightcone-tunnel.py;." \
-    --collect-all nicegui \
-    --hidden-import cryptography \
-    --hidden-import cryptography.hazmat.primitives.ciphers.aead \
-    --hidden-import zfec \
-    lightcone-manager.py
-```
-
-Linux:
-```bash
-pyinstaller --onefile --windowed --name LightconeManager \
-    --add-data "lightcone-tunnel.py:." \
-    --collect-all nicegui \
-    --hidden-import cryptography \
-    --hidden-import cryptography.hazmat.primitives.ciphers.aead \
-    --hidden-import zfec \
-    lightcone-manager.py
-```
-
-
 ## Contributing
 
 Issues and pull requests are welcome. Please open an issue first to discuss your idea before submitting a PR.
@@ -272,6 +253,5 @@ source venv/bin/activate
 pip install -r requirements-gui.txt
 pip install pyinstaller
 ```
----
 
 **License**: MIT
