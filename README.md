@@ -6,117 +6,155 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)]()
 
----
 
-## 📖 Overview
+## About
 
-**Lightcone Tunnel** is a high-performance UDP tunnel that encapsulates TCP/UDP traffic through encrypted, anti-DPI UDP datagrams. It functions as a **SOCKS5/HTTP proxy** on the client side and a **Full-Cone NAT forwarder** on the server side, making it ideal for:
+**Lightcone Tunnel** is a single-file, cross-platform UDP tunnel that provides SOCKS5/HTTP proxy on the client side and full-cone NAT forwarding on the server side. It is designed for network environments where stability is poor or restrictions are present.
 
-- 🌐 **Bypassing network restrictions** — Anti-DPI obfuscation defeats deep packet inspection
-- 📡 **Unstable networks** — RS-FEC recovers from packet loss without TCP retransmission overhead
-- 🔒 **Secure remote access** — ChaCha20-Poly1305 AEAD encryption with anti-replay protection
-- 🖥️ **Desktop-friendly** — Cross-platform GUI for non-technical users
+Key features:
 
----
+- **Anti-packet-loss**: RS-FEC (Reed-Solomon forward error correction) — with `(12,4)` configuration, recovers from up to 25% packet loss
+- **Anti-DPI**: No fixed magic bytes, random packet sizes (800–1200 bytes), Burst-mode jitter
+- **Secure**: ChaCha20-Poly1305 AEAD encryption with 64-bit anti-replay protection
+- **Cross-platform**: Windows / Linux with both GUI and CLI interfaces
 
-## ✨ Key Features
 
-### 🔐 Security & Anti-DPI
-- **ChaCha20-Poly1305 AEAD** encryption with 64-bit monotonic sequence anti-replay
-- **No fixed protocol signatures** — randomized 4-byte per-packet prefix eliminates `LCT1` magic bytes
-- **Dynamic payload sizing** — 800-1200 bytes random chunk size defeats length-based fingerprinting
-- **Burst-mode packet scheduling** — 0.1-0.3ms jitter per 12 packets destroys timing pattern detection
+## What It Does
 
-### 🛡️ Anti-Packet-Loss (RS-FEC)
-- **Reed-Solomon Forward Error Correction** with configurable (N, M) parameters
-- **64-bit Group ID** — never wraps, supports indefinite 7×24 operation
-- **Zero-latency delivery** — uncorrupted data shards delivered immediately, no FEC group wait
-- **Automatic fallback** — pure Python XOR fallback when `zfec` C-extension is unavailable
+| Role | Function |
+| :--- | :--- |
+| **Client** | Starts SOCKS5 (port 1080) and HTTP proxy (port 8080), receives traffic from browsers/applications, encrypts it, and forwards it to the server via UDP tunnel |
+| **Server** | Listens on UDP port, decrypts traffic, reconstructs streams, and forwards them to the target service (e.g., internal SSH, web server) |
 
-### 🖥️ Cross-Platform GUI
-- **Multi-configuration management** — create, edit, delete up to 10 config profiles
-- **One-click start/stop** — no command line required
-- **Real-time log viewer** — live tunnel output with auto-scroll and export
-- **Multi-language support** — English, 简体中文, 繁體中文
-- **Single-instance lock** — prevents accidental dual-launch
+**Typical use cases:**
 
-### 🌍 Network Capabilities
-- **SOCKS5 proxy** with TCP CONNECT and UDP ASSOCIATE (Full-Cone NAT)
-- **HTTP/HTTPS CONNECT proxy** — works with browsers and standard tools
-- **IPv4/IPv6 dual-stack** — seamless address family handling
-- **DDNS resilience** — automatic background DNS refresh every 60 seconds
-- **Full-Cone NAT UDP forwarding** — symmetric NAT traversal for UDP-based applications
+- Browser traffic routed through SOCKS5 proxy to bypass restrictions
+- Port forwarding over unreliable networks (similar to SSH forwarding but over UDP with FEC)
+- Remote access to SSH/RDP/web services
 
-### 🚀 Performance & Reliability
-- **Asynchronous I/O** — Python `asyncio` for high-concurrency multiplexing
-- **Resource auto-reclamation** — idle TCP streams and UDP sessions cleaned after 5 minutes
-- **Connection rate-limiting** — configurable concurrent stream limit (default: 1024)
-- **Memory-safe** — no `RLIMIT_AS` hard limit; delegate to container/systemd
 
----
+## Technical Overview
 
-## 📦 Project Structure
+**Encryption protocol (outer layer):**
 
 ```
-lightcone-tunnel/
-├── lightcone-tunnel.py          # Core tunnel engine (CLI)
-├── lightcone-manager.py         # GUI management application
-├── build.py                     # PyInstaller packaging script
-├── config_client.yaml           # Client configuration template
-├── config_server.yaml           # Server configuration template
-├── requirements.txt             # Core dependencies
-├── requirements-gui.txt         # GUI dependencies
-├── configs/                     # User config storage (auto-created)
-│   └── default_client.yaml
-└── README.md
+[RandomPrefix 4B] [Seq 8B] [Timestamp 8B] [PadLen 1B] [Nonce 12B] [ChaCha20 Ciphertext]
 ```
 
----
+- No fixed magic bytes — eliminates signatures like `LCT1`
+- 64-bit sequence numbers — monotonic, never wrap
+- ChaCha20-Poly1305 AEAD authenticated encryption
 
-## 🚀 Quick Start
+**FEC protocol (inside encrypted payload, invisible from outside):**
 
-### Option 1: Download Pre-built Release (Recommended)
+```
+[Group ID 8B] [ShardIdx 1B] [N 1B] [M 1B] [RawLen 2B] [Shard Data]
+```
 
-Download the latest release from [GitHub Releases](https://github.com/u3dsteve/lightcone-tunnel/releases):
+- 64-bit Group ID — never wraps
+- Zero-latency delivery — uncorrupted shards are delivered immediately; FEC recovery only triggers when loss occurs
+- `zfec` C-extension accelerated; falls back to pure Python XOR when `zfec` is unavailable
+
+**Anti-DPI mechanisms:**
+
+- Packet sizes randomized between 800–1200 bytes — no fixed pattern
+- Burst Mode: micro-sleep (0.1–0.3ms) every 12 packets — breaks timing patterns
+
+
+## Deployment
+
+### Option 1: Pre-built GUI (Recommended)
+
+Download the `LightconeManager` executable for your platform from the Releases page and double-click to run.
+
+- **Windows**: `LightconeManager.exe`
+- **Linux**: `LightconeManager` (set executable: `chmod +x`)
+
+**Using the GUI:**
+
+1. First launch automatically creates `configs/default_client.yaml`
+2. Edit configuration (server address, PSK, FEC parameters, etc.), click Save
+3. Click **Start Engine**
+
+Configurations are stored in `configs/` directory — you can switch between multiple profiles.
+
+### Option 2: CLI Mode (Headless)
+
+**Start the client:**
 
 ```bash
-# Windows: Download LightconeManager.exe, double-click to run
-# Linux: Download LightconeManager, chmod +x, then run
-```
-
-**The GUI requires no Python installation.**
-
-### Option 2: Run from Source
-
-```bash
-# Clone the repository
-git clone https://github.com/u3dsteve/lightcone-tunnel
-cd lightcone-tunnel
-
-# Install dependencies (recommended: use virtual environment)
-python3 -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-pip install -r requirements-gui.txt
-
-# Start the GUI
-python lightcone-manager.py
-```
-
-### Option 3: CLI Mode (Headless)
-
-```bash
-# Start as client
 python lightcone-tunnel.py config_client.yaml
+```
 
-# Start as server
+**Start the server:**
+
+```bash
 python lightcone-tunnel.py config_server.yaml
 ```
 
----
+### Option 3: Docker Deployment
 
-## 📋 Configuration
+**Dockerfile:**
 
-### Client Configuration (`config_client.yaml`)
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir cryptography pyyaml zfec
+
+COPY lightcone-tunnel.py /app/lightcone-tunnel.py
+
+ENTRYPOINT ["python3", "/app/lightcone-tunnel.py"]
+```
+
+**docker-compose.yml:**
+
+```yaml
+services:
+  lightcone-server:
+    build: .
+    container_name: lightcone-server
+    restart: always
+    network_mode: host
+    volumes:
+      - ./config_server.yaml:/app/config.yaml:ro
+    command: ["/app/config.yaml"]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  lightcone-client:
+    build: .
+    container_name: lightcone-client
+    restart: always
+    network_mode: host
+    volumes:
+      - ./config_client.yaml:/app/config.yaml:ro
+    command: ["/app/config.yaml"]
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+```
+
+**Run services:**
+
+```bash
+# Build and run server
+docker compose up -d --build lightcone-server
+
+# Build and run client
+docker compose up -d --build lightcone-client
+
+# View logs
+docker compose logs -f
+```
+
+### Configuration Examples
+
+**Client (`config_client.yaml`):**
 
 ```yaml
 role: "client"
@@ -130,7 +168,7 @@ max_concurrent_streams: 1024
 log_level: "info"
 ```
 
-### Server Configuration (`config_server.yaml`)
+**Server (`config_server.yaml`):**
 
 ```yaml
 role: "server"
@@ -142,35 +180,55 @@ max_concurrent_streams: 1024
 log_level: "info"
 ```
 
-### FEC Parameter Guide
-
-| Setting | Tolerance | Bandwidth Overhead | Use Case |
-| :--- | :--- | :--- | :--- |
-| `0, 0` | 0% | 0% | Clean networks (FEC disabled) |
-| `8, 2` | ~20% | ~25% | Moderate packet loss |
-| `12, 4` | ~25% | ~33% | High packet loss (default) |
-| `16, 4` | ~20% | ~25% | Very high throughput |
-
-**Note:** Client and server MUST use identical FEC parameters.
-
----
-
-## 🔧 Packaging from Source
-
-### Build Executables
+### Verification
 
 ```bash
-# Install packaging dependencies
-pip install pyinstaller
+# Test SOCKS5
+curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
 
-# Run the build script
-python build.py
-
-# Output: dist/LightconeManager.exe (Windows) or dist/LightconeManager (Linux)
+# Test HTTP proxy
+curl -x http://127.0.0.1:8080 https://ifconfig.me
 ```
 
-### Manual Build (Windows)
 
+## Building from Source
+
+### Install Dependencies
+
+```bash
+# Clone repository
+git clone https://github.com/u3dsteve/lightcone-tunnel
+cd lightcone-tunnel
+
+# Create virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
+# Install core dependencies
+pip install -r requirements.txt
+
+# Install GUI dependencies (if building GUI)
+pip install -r requirements-gui.txt
+
+# Install packaging tool
+pip install pyinstaller
+```
+
+### Package Executables
+
+**Automatic build (detects current platform):**
+
+```bash
+python build.py
+
+# Outputs:
+# Windows: dist/LightconeManager.exe
+# Linux:   dist/LightconeManager
+```
+
+**Manual build commands:**
+
+Windows:
 ```bash
 pyinstaller --onefile --windowed --name LightconeManager \
     --add-data "lightcone-tunnel.py;." \
@@ -181,8 +239,7 @@ pyinstaller --onefile --windowed --name LightconeManager \
     lightcone-manager.py
 ```
 
-### Manual Build (Linux)
-
+Linux:
 ```bash
 pyinstaller --onefile --windowed --name LightconeManager \
     --add-data "lightcone-tunnel.py:." \
@@ -193,102 +250,19 @@ pyinstaller --onefile --windowed --name LightconeManager \
     lightcone-manager.py
 ```
 
-### Prerequisites for Linux Native GUI (Optional)
 
-If you want native window support (instead of browser mode):
+## Contributing
 
-```bash
-# System dependencies
-sudo apt install python3-gi python3-gi-cairo gir1.2-gtk-3.0 gir1.2-webkit2-4.1
+Issues and pull requests are welcome. Please open an issue first to discuss your idea before submitting a PR.
 
-# Python dependencies
-pip install pywebview[gtk]
-```
+**Code guidelines:**
 
----
+- Core tunnel logic stays in `lightcone-tunnel.py` (single-file)
+- GUI logic in `lightcone-manager.py`
+- Configuration fields follow `config_client.yaml` / `config_server.yaml`
+- Use English comments
 
-## 📊 Performance
-
-### Bandwidth Impact (Burst Mode)
-
-| Scenario | Throughput | Latency Impact |
-| :--- | :--- | :--- |
-| No jitter | Physical bandwidth limit | None |
-| Burst Mode (12 packets, 0.1-0.3ms) | ~320 Mbps+ | Minimal |
-
-### FEC Overhead
-
-| Configuration | Overhead | Recovery Capability |
-| :--- | :--- | :--- |
-| N=12, M=4 | ~33% | Up to 25% packet loss |
-| N=8, M=2 | ~25% | Up to 20% packet loss |
-
----
-
-## 🔍 Verification
-
-```bash
-# Check server UDP binding
-ss -ulpn | grep 8443
-
-# Test SOCKS5 proxy
-curl -x socks5h://127.0.0.1:1080 https://ifconfig.me
-
-# Test HTTP proxy
-curl -x http://127.0.0.1:8080 https://ifconfig.me
-```
-
----
-
-## 🐛 Troubleshooting
-
-### GUI won't start on Linux
-```bash
-# Ensure XDG_RUNTIME_DIR is set
-export XDG_RUNTIME_DIR=/run/user/$(id -u)
-
-# Run with browser mode (if native fails)
-# (GUI already uses browser mode by default in packaged builds)
-```
-
-### "Port already in use" error
-```bash
-# Check what's using the port
-ss -tulpn | grep 1080
-# Change socks_port in config file
-```
-
-### FEC decode timeouts appear frequently
-- Increase `fec_decode_timeout` (not yet exposed in GUI config form; can be adjusted in source for now)
-- Or adjust FEC parameters to match your network conditions
-
-### Tunnel runs but no traffic passes
-- Verify PSK matches on both client and server
-- Check firewall allows UDP on configured port
-- Confirm server's `server_addr` is reachable (client resolves via DDNS)
-
----
-
-## 📝 Version History
-
-| Version | Key Changes |
-| :--- | :--- |
-| **v1.2.4** | GUI: single-instance lock, exit confirmation, @ui.refreshable refactor, multiprocessing guard |
-| **v1.2.3** | GUI: browser mode (no pywebview dependency), automatic browser launch |
-| **v1.2.2** | GUI: Linux native window support (pywebview), build system fixes |
-| **v1.2.1** | GUI: cross-platform packaging, configurable FEC, multi-language |
-| **v1.2.0** | RS-FEC anti-packet-loss engine, 64-bit Group ID |
-| **v1.1.6** | Full path Burst Mode (TCP + UDP) |
-| **v1.1.5** | Anti-DPI: removed MAGIC_BYTES, dynamic payload sizing |
-| **v1.1.0** | Initial release |
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please open an issue or submit a pull request.
-
-### Development Setup
+**Development setup:**
 
 ```bash
 git clone https://github.com/u3dsteve/lightcone-tunnel
@@ -298,21 +272,6 @@ source venv/bin/activate
 pip install -r requirements-gui.txt
 pip install pyinstaller
 ```
-
-### Code Style
-- Follow PEP 8
-- Keep core tunnel engine single-file (`lightcone-tunnel.py`)
-- GUI should be a separate module (`lightcone-manager.py`)
-- Use English comments for main code logic
-
 ---
 
-## 📄 License
-
-MIT License — see [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-Built by network engineers who migrate machines and secure networks — shared for everyone who does the same.
+**License**: MIT
