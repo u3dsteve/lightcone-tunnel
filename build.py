@@ -40,6 +40,8 @@ def get_base_cmd():
         "--windowed",
         "--name", APP_NAME,
         "--collect-all", "nicegui",
+        "--collect-all", "webencodings",
+        "--collect-all", "tinycss2",
         "--add-data", f"lightcone-tunnel.py{os.pathsep}.",
         "--hidden-import", "cryptography",
         "--hidden-import", "cryptography.hazmat.primitives.ciphers.aead",

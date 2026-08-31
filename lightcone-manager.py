@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Lightcone Tunnel GUI Manager v1.2.4 (i18n Exit Notice Fix)
-Built with NiceGUI for Cross-Platform Desktop Management
+Lightcone Manager - GUI Console for Lightcone Tunnel
+Version: 1.4.4
+Framework: NiceGUI (Material You / M3 Expressive Theme)
 """
 
-import asyncio
-import importlib.util
-import multiprocessing
 import os
-import re
 import sys
-from pathlib import Path
-from typing import Dict, Any, Optional
-
+import re
+import socket
+import asyncio
+import subprocess
+import signal
 import yaml
+import atexit
+import importlib.util
+from pathlib import Path
+from typing import Dict, Any, List, Optional
+from nicegui import ui, app
 
-# ============================================================================
-# PyInstaller Multi-processing Guard & Worker Entry Point
-# ============================================================================
-multiprocessing.freeze_support()
-
+# Handle PyInstaller multiprocess worker execution flag
 if "--worker" in sys.argv:
     search_dirs = [os.path.dirname(os.path.abspath(sys.argv[0]))]
     if hasattr(sys, '_MEIPASS'):
@@ -36,7 +38,7 @@ if "--worker" in sys.argv:
             break
 
     if not target_script:
-        print(f"Error: lightcone-tunnel.py core script not found in: {search_dirs}")
+        print(f"Error: lightcone-tunnel.py not found in: {search_dirs}")
         sys.exit(1)
 
     try:
@@ -54,646 +56,765 @@ if "--worker" in sys.argv:
         print(f"Error executing worker module: {e}")
         sys.exit(1)
 
-# ----------------------------------------------------------------------------
-# Single Instance Lock
-# ----------------------------------------------------------------------------
-def acquire_single_instance_lock():
-    lock_file = Path("/tmp/lightcone_manager.lock")
+def get_base_dir() -> Path:
+    """Retrieve absolute path to application binary or script directory."""
+    if getattr(sys, 'frozen', False):
+        return Path(os.path.dirname(sys.executable))
+    return Path(__file__).parent.resolve()
+
+BASE_DIR = get_base_dir()
+LOCK_FILE = BASE_DIR / "manager.lock"
+SETTINGS_FILE = BASE_DIR / "manager_settings.yaml"
+CONFIGS_DIR = BASE_DIR / "configs"
+
+def acquire_instance_lock():
+    """Ensure single instance execution across platforms."""
     try:
-        fp = open(lock_file, "w")
-        import fcntl
-        fcntl.flock(fp, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fp
-    except (IOError, OSError):
-        print("[Error] Another instance of Lightcone Manager is already running on this machine.")
+        if sys.platform == "win32":
+            import msvcrt
+            lock_file_handle = os.open(str(LOCK_FILE), os.O_CREAT | os.O_RDWR)
+            msvcrt.locking(lock_file_handle, msvcrt.LK_NBLCK, 1)
+            return lock_file_handle
+        else:
+            import fcntl
+            lock_file_handle = open(LOCK_FILE, "w")
+            fcntl.flock(lock_file_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return lock_file_handle
+    except Exception:
+        print("Error: Another instance of Lightcone Manager is already running.")
         sys.exit(1)
-    except ImportError:
-        return None
 
-_instance_lock = acquire_single_instance_lock()
+def release_instance_lock():
+    """Release instance file lock and explicitly purge lockfile."""
+    global lock_handle
+    if lock_handle is not None:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(lock_handle, msvcrt.LK_UNLCK, 1)
+                os.close(lock_handle)
+            else:
+                import fcntl
+                fcntl.flock(lock_handle, fcntl.LOCK_UN)
+                lock_handle.close()
+        except Exception:
+            pass
+        finally:
+            lock_handle = None
 
-from nicegui import ui, app
+    if LOCK_FILE.exists():
+        try:
+            LOCK_FILE.unlink()
+        except Exception:
+            pass
 
-# ============================================================================
-# i18n Dictionary Definition
-# ============================================================================
+lock_handle = acquire_instance_lock()
+atexit.register(release_instance_lock)
+
+DEFAULT_SETTINGS = {
+    "gui_host": "127.0.0.1",
+    "gui_port": 8000,
+    "auto_start_enabled": False,
+    "default_config": "",
+    "language": "zh-CN"
+}
+
+def load_settings() -> Dict[str, Any]:
+    """Load settings from YAML file or initialize defaults."""
+    if not SETTINGS_FILE.exists():
+        save_settings(DEFAULT_SETTINGS)
+        return DEFAULT_SETTINGS.copy()
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+            merged = DEFAULT_SETTINGS.copy()
+            merged.update(data)
+            return merged
+    except Exception:
+        return DEFAULT_SETTINGS.copy()
+
+def save_settings(settings: Dict[str, Any]) -> None:
+    """Save current settings dictionary to local YAML file."""
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            yaml.safe_dump(settings, f, allow_unicode=True)
+    except Exception as e:
+        print(f"Failed to save settings: {e}")
+
+def get_tunnel_script_path() -> Optional[Path]:
+    """Locate lightcone-tunnel.py relative to base execution directory or PyInstaller bundle."""
+    search_dirs = [BASE_DIR]
+    if hasattr(sys, '_MEIPASS'):
+        search_dirs.insert(0, Path(sys._MEIPASS))
+
+    for directory in search_dirs:
+        for fname in ["lightcone-tunnel.py", "lightcone_tunnel.py"]:
+            candidate = directory / fname
+            if candidate.exists():
+                return candidate
+    return None
+
+class TunnelStateManager:
+    """Encapsulates process lifecycle, active configuration, and reactive UI language state."""
+    def __init__(self, initial_lang: str = "zh-CN"):
+        self._lock = asyncio.Lock()
+        self.is_running: bool = False
+        self.active_config: str = ""
+        self.process: Optional[subprocess.Popen] = None
+        self.log_task: Optional[asyncio.Task] = None
+        self.lang: str = initial_lang
+
+    async def get_state_snapshot(self) -> tuple[bool, str]:
+        """Safely fetch running status and active config under lock."""
+        async with self._lock:
+            return self.is_running, self.active_config
+
+    async def select_config(self, cfg_name: str) -> bool:
+        async with self._lock:
+            if self.is_running:
+                return False
+            self.active_config = cfg_name
+            return True
+
+    async def start(self, process: subprocess.Popen, cfg_name: str, task: asyncio.Task):
+        async with self._lock:
+            self.process = process
+            self.is_running = True
+            self.active_config = cfg_name
+            self.log_task = task
+
+    async def stop(self):
+        async with self._lock:
+            self.is_running = False
+            self.process = None
+            if self.log_task and not self.log_task.done():
+                self.log_task.cancel()
+            self.log_task = None
+
+app_settings = load_settings()
+state = TunnelStateManager(initial_lang=app_settings.get("language", "zh-CN"))
+
+log_buffer: List[str] = []
+
 I18N = {
     "en": {
-        "title": "Lightcone Tunnel Manager",
+        "title": "Lightcone Console",
         "configs": "Configurations",
-        "add_config": "Add Config",
-        "start": "Start Engine",
-        "stop": "Stop Engine",
-        "exit_app": "Exit App",
-        "confirm_exit": "Are you sure you want to close the application?",
-        "exit_notice": "Application closed. Please run again if needed.",
-        "status_running": "RUNNING",
-        "status_stopped": "STOPPED",
-        "tab_config": "Configuration",
-        "tab_logs": "Live Logs",
-        "save": "Save Changes",
-        "delete": "Delete",
+        "logs": "Live System Logs",
+        "settings": "Settings",
+        "start": "Start Tunnel",
+        "stop": "Stop Tunnel",
+        "running": "Running",
+        "stopped": "Stopped",
+        "active": "Active",
+        "switch_warn": "Tunnel is currently running. Please stop it before changing configuration.",
+        "auto_start": "Auto-start tunnel on manager launch",
+        "default_config": "Default Launch Config",
+        "host": "Console Listen Host",
+        "port": "Console Listen Port",
+        "save": "Save Settings",
         "cancel": "Cancel",
-        "create": "Create",
-        "role": "Node Role",
-        "server_addr": "Server Address (Host:Port)",
-        "psk": "Pre-Shared Key (PSK)",
-        "socks_port": "Local SOCKS5 Port",
-        "http_port": "Local HTTP Proxy Port",
-        "fec_enable": "Enable RS-FEC Forward Error Correction",
-        "fec_n": "FEC Data Shards (N)",
-        "fec_m": "FEC Parity Shards (M)",
-        "max_streams": "Max Concurrent Streams",
-        "log_level": "Log Level",
+        "delete": "Delete",
+        "delete_config": "Delete Config",
+        "delete_confirm": "Are you sure you want to delete configuration '{fname}'?",
+        "restart_notice": "Host and Port changes require application restart.",
+        "saved_toast": "Settings saved successfully.",
+        "no_configs": "No configuration files found in ./configs",
+        "refresh": "Refresh",
         "clear_logs": "Clear Logs",
-        "export_logs": "Export Logs",
-        "dialog_name_placeholder": "Config Name (1-20 chars)",
-        "err_max_configs": "Maximum 10 configurations allowed.",
-        "err_name_len": "Name must be between 1 and 20 characters.",
-        "err_invalid_chars": "Name contains invalid filename characters.",
-        "err_name_exists": "Configuration name already exists.",
-        "err_delete_running": "Cannot delete configuration while tunnel is running.",
-        "msg_saved": "Configuration saved successfully.",
-        "msg_deleted": "Configuration removed.",
-        "confirm_delete": "Are you sure you want to delete this configuration?",
+        "status_label": "Status",
+        "current_config": "Active Config",
+        "add_config": "Add Config File",
+        "config_name": "Configuration Name",
+        "config_content": "YAML Configuration Content",
+        "exit_app": "Exit Manager",
+        "exit_confirm": "Are you sure you want to stop active processes and exit Lightcone Console?",
+        "exiting_notice": "Shutting down services, please wait...",
+        "invalid_filename": "Configuration name contains invalid characters.",
     },
     "zh-CN": {
-        "title": "Lightcone Tunnel 控制台",
-        "configs": "配置列表",
-        "add_config": "新建配置",
+        "title": "Lightcone 控制台",
+        "configs": "配置文件",
+        "logs": "实时运行日志",
+        "settings": "系统设置",
         "start": "启动隧道",
         "stop": "停止隧道",
-        "exit_app": "关闭程序",
-        "confirm_exit": "确定要关闭程序吗？",
-        "exit_notice": "程序已关闭，若需要请再次运行。",
-        "status_running": "运行中",
-        "status_stopped": "已停止",
-        "tab_config": "配置参数",
-        "tab_logs": "实时日志",
-        "save": "保存配置",
-        "delete": "删除配置",
+        "running": "运行中",
+        "stopped": "已停止",
+        "active": "当前生效",
+        "switch_warn": "隧道运行中，请先停止隧道再切换配置文件。",
+        "auto_start": "开启程序时自动启动隧道",
+        "default_config": "默认启动配置",
+        "host": "控制台监听 IP",
+        "port": "控制台监听端口",
+        "save": "保存设置",
         "cancel": "取消",
-        "create": "创建",
-        "role": "运行角色",
-        "server_addr": "服务器地址 (IP/域名:端口)",
-        "psk": "预共享密钥 (PSK)",
-        "socks_port": "本地 SOCKS5 端口",
-        "http_port": "本地 HTTP 代理端口",
-        "fec_enable": "启用 RS-FEC 前向纠错保护",
-        "fec_n": "FEC 数据分片 (N)",
-        "fec_m": "FEC 校验分片 (M)",
-        "max_streams": "最大并发流数",
-        "log_level": "日志级别",
+        "delete": "删除",
+        "delete_config": "删除配置文件",
+        "delete_confirm": "确定要删除配置文件 '{fname}' 吗？",
+        "restart_notice": "修改监听 IP 或端口需重启控制台后生效。",
+        "saved_toast": "设置保存成功。",
+        "no_configs": "未在 ./configs 目录找到配置文件。",
+        "refresh": "刷新",
         "clear_logs": "清空日志",
-        "export_logs": "导出日志",
-        "dialog_name_placeholder": "配置名称 (1-20 字符)",
-        "err_max_configs": "最多只能创建 10 个配置。",
-        "err_name_len": "配置名称须为 1-20 个字符。",
-        "err_invalid_chars": "配置名称不能包含非法路径字符 (\\ / : * ? \" < > |)。",
-        "err_name_exists": "配置名称已存在。",
-        "err_delete_running": "无法删除正在运行中的隧道配置，请先停止服务。",
-        "msg_saved": "配置保存成功。",
-        "msg_deleted": "配置已删除。",
-        "confirm_delete": "确定要删除此配置吗？",
+        "status_label": "运行状态",
+        "current_config": "当前配置",
+        "add_config": "添加配置文件",
+        "config_name": "配置文件名称",
+        "config_content": "YAML 配置内容",
+        "exit_app": "退出程序",
+        "exit_confirm": "确定要停止运行并退出 Lightcone 控制台吗？",
+        "exiting_notice": "正在停止服务并退出，请稍候...",
+        "invalid_filename": "配置文件名称包含非法字符。",
     },
     "zh-TW": {
-        "title": "Lightcone Tunnel 控制台",
-        "configs": "設定列表",
-        "add_config": "新建設定",
+        "title": "Lightcone 控制台",
+        "configs": "設定檔列表",
+        "logs": "即時運行日誌",
+        "settings": "系統設定",
         "start": "啟動隧道",
         "stop": "停止隧道",
-        "exit_app": "關閉程式",
-        "confirm_exit": "確定要關閉程式嗎？",
-        "exit_notice": "程式已關閉，若需要請再次運行。",
-        "status_running": "運行中",
-        "status_stopped": "已停止",
-        "tab_config": "設定參數",
-        "tab_logs": "實時日誌",
+        "running": "運行中",
+        "stopped": "已停止",
+        "active": "當前生效",
+        "switch_warn": "隧道運行中，請先停止隧道再切換設定檔。",
+        "auto_start": "開啟程序時自動啟動隧道",
+        "default_config": "預設啟動設定",
+        "host": "控制台監聽 IP",
+        "port": "控制台監聽埠",
         "save": "儲存設定",
-        "delete": "刪除設定",
         "cancel": "取消",
-        "create": "建立",
-        "role": "運行角色",
-        "server_addr": "伺服器地址 (IP/域名:通訊埠)",
-        "psk": "預共享金鑰 (PSK)",
-        "socks_port": "本地 SOCKS5 通訊埠",
-        "http_port": "本地 HTTP 代理通訊埠",
-        "fec_enable": "啟用 RS-FEC 前向糾錯保護",
-        "fec_n": "FEC 資料分片 (N)",
-        "fec_m": "FEC 校驗分片 (M)",
-        "max_streams": "最大並發流數",
-        "log_level": "日誌級別",
+        "delete": "刪除",
+        "delete_config": "刪除設定檔",
+        "delete_confirm": "確定要刪除設定檔 '{fname}' 嗎？",
+        "restart_notice": "修改監聽 IP 或埠需重啟控制台後生效。",
+        "saved_toast": "設定儲存成功。",
+        "no_configs": "未在 ./configs 目錄找到設定檔。",
+        "refresh": "重新整理",
         "clear_logs": "清除日誌",
-        "export_logs": "匯出日誌",
-        "dialog_name_placeholder": "設定名稱 (1-20 字元)",
-        "err_max_configs": "最多只能建立 10 個設定。",
-        "err_name_len": "設定名稱須為 1-20 個字元。",
-        "err_invalid_chars": "設定名稱不能包含非法路徑字元 (\\ / : * ? \" < > |)。",
-        "err_name_exists": "設定名稱已存在。",
-        "err_delete_running": "無法刪除正在運行中的隧道設定，請先停止服務。",
-        "msg_saved": "設定儲存成功。",
-        "msg_deleted": "設定已刪除。",
-        "confirm_delete": "確定要刪除此設定嗎？",
+        "status_label": "運行狀態",
+        "current_config": "當前設定",
+        "add_config": "新增設定檔",
+        "config_name": "設定檔名稱",
+        "config_content": "YAML 設定內容",
+        "exit_app": "退出程式",
+        "exit_confirm": "確定要停止運行並退出 Lightcone 控制台嗎？",
+        "exiting_notice": "正在停止服務並退出，請稍候...",
+        "invalid_filename": "設定檔名稱包含非法字元。",
     }
 }
 
-DEFAULT_CLIENT_CONFIG = {
-    "role": "client",
-    "server_addr": "127.0.0.1:8443",
-    "psk": "YourStrongSecretPSKKeyHere",
-    "socks_port": 1080,
-    "http_port": 8080,
-    "fec_data_shards": 12,
-    "fec_parity_shards": 4,
-    "max_concurrent_streams": 1024,
-    "log_level": "info",
-}
+def t(key: str) -> str:
+    """Translate UI text key based on active language in state."""
+    return I18N.get(state.lang, I18N["zh-CN"]).get(key, key)
 
-MAX_LOG_LINES = 2000
-CONFIG_DIR = Path("configs")
+def get_config_files() -> List[str]:
+    """Retrieve list of configuration files without file extension."""
+    if not CONFIGS_DIR.exists():
+        CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted([f.stem for f in CONFIGS_DIR.glob("*.yaml")] + [f.stem for f in CONFIGS_DIR.glob("*.yml")])
+    return list(dict.fromkeys(files))
 
+available_configs = get_config_files()
+if app_settings.get("default_config") in available_configs:
+    state.active_config = app_settings["default_config"]
+elif available_configs:
+    state.active_config = available_configs[0]
 
-# ============================================================================
-# Tunnel Manager Core State & Lifecycle
-# ============================================================================
-class TunnelAppState:
-    def __init__(self):
-        self.lang = "en"
-        self.active_config_name: Optional[str] = None
-        self.configs: Dict[str, Dict[str, Any]] = {}
-        self.process: Optional[asyncio.subprocess.Process] = None
-        self.log_widget: Optional[ui.log] = None
-        self.log_buffer = []
-        self.load_configs()
+log_view: Optional[ui.log] = None
 
-    def t(self, key: str) -> str:
-        return I18N.get(self.lang, I18N["en"]).get(key, key)
+async def select_config(cfg_name: str):
+    """Handle configuration card click event with validation."""
+    success = await state.select_config(cfg_name)
+    if not success:
+        ui.notify(t("switch_warn"), type="warning", position="top")
+        return
+    render_header.refresh()
+    render_config_list.refresh()
 
-    def load_configs(self):
-        CONFIG_DIR.mkdir(exist_ok=True)
-        self.configs.clear()
-        for p in CONFIG_DIR.glob("*.yaml"):
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    data = yaml.safe_load(f) or {}
-                    self.configs[p.stem] = data
-            except Exception as e:
-                print(f"Error loading {p}: {e}")
-
-        if not self.configs:
-            self.configs["default_client"] = DEFAULT_CLIENT_CONFIG.copy()
-            self.save_config_file("default_client", DEFAULT_CLIENT_CONFIG)
-
-        if not self.active_config_name or self.active_config_name not in self.configs:
-            self.active_config_name = next(iter(self.configs.keys()))
-
-    def save_config_file(self, name: str, data: Dict[str, Any]):
-        CONFIG_DIR.mkdir(exist_ok=True)
-        file_path = CONFIG_DIR / f"{name}.yaml"
-        with open(file_path, "w", encoding="utf-8") as f:
-            yaml.dump(data, f, default_flow_style=False, sort_keys=False)
-
-    def delete_config_file(self, name: str):
-        file_path = CONFIG_DIR / f"{name}.yaml"
-        if file_path.exists():
-            file_path.unlink()
-
-    def append_log(self, text: str):
-        self.log_buffer.append(text)
-        if len(self.log_buffer) > MAX_LOG_LINES:
-            self.log_buffer.pop(0)
-        if self.log_widget:
-            self.log_widget.push(text)
-
-    @property
-    def is_running(self) -> bool:
-        return self.process is not None and self.process.returncode is None
-
-
-state = TunnelAppState()
-
-
-# ============================================================================
-# Subprocess Management
-# ============================================================================
-async def start_tunnel_engine():
-    if state.is_running or not state.active_config_name:
+async def start_tunnel():
+    """Start lightcone tunnel background process without lock conflicts."""
+    is_running, active_cfg = await state.get_state_snapshot()
+    if is_running or not active_cfg:
         return
 
-    config_path = str((CONFIG_DIR / f"{state.active_config_name}.yaml").resolve())
+    config_path = CONFIGS_DIR / f"{active_cfg}.yaml"
+    if not config_path.exists():
+        config_path = CONFIGS_DIR / f"{active_cfg}.yml"
+
+    if not config_path.exists():
+        ui.notify(f"Config file for {active_cfg} not found!", type="negative")
+        return
 
     if getattr(sys, 'frozen', False):
-        cmd = [sys.executable, "--worker", config_path]
+        cmd = [sys.executable, "--worker", str(config_path)]
     else:
-        script_dir = Path(__file__).parent
-        tunnel_script = script_dir / "lightcone-tunnel.py"
-        if not tunnel_script.exists():
-            tunnel_script = script_dir / "lightcone_tunnel.py"
-        cmd = [sys.executable, "-u", str(tunnel_script), config_path]
-
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
+        tunnel_script = get_tunnel_script_path()
+        if tunnel_script is None:
+            ui.notify("lightcone-tunnel.py not found!", type="negative")
+            return
+        cmd = [sys.executable, str(tunnel_script), str(config_path)]
 
     try:
-        state.process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            creationflags=creation_flags
         )
-        state.append_log(f"[Manager] Engine started with config: '{state.active_config_name}'")
-        ui.update()
+        log_task = asyncio.create_task(read_tunnel_logs(proc))
+        await state.start(proc, active_cfg, log_task)
 
-        asyncio.create_task(read_process_output())
+        render_header.refresh()
+        render_config_list.refresh()
+
+        ui.notify(f"Tunnel started: [{active_cfg}]", type="positive")
     except Exception as e:
-        error_msg = str(e)
-        if "Address already in use" in error_msg or "cannot bind" in error_msg or "Errno 98" in error_msg:
-            state.append_log("[Manager] Port already in use. Please check local/remote binding conflict.")
-        elif "Permission denied" in error_msg or "Errno 13" in error_msg:
-            state.append_log("[Manager] Permission denied. Try running with elevated privileges.")
-        else:
-            state.append_log(f"[Manager Exception] Failed to start process: {e}")
-        state.process = None
-        ui.update()
+        ui.notify(f"Failed to start tunnel: {e}", type="negative")
 
+async def stop_tunnel():
+    """Stop running lightcone tunnel background process cleanly with responsive polling."""
+    if not state.is_running or state.process is None:
+        return
 
-async def read_process_output():
     proc = state.process
-    if not proc or not proc.stdout:
-        return
-
-    while proc.returncode is None:
-        line = await proc.stdout.readline()
-        if not line:
-            break
-        text = line.decode('utf-8', errors='ignore').rstrip()
-        if text:
-            state.append_log(text)
-
-    await proc.wait()
-    state.append_log(f"[Manager] Engine stopped with exit code: {proc.returncode}")
-    if state.process == proc:
-        state.process = None
-    ui.update()
-
-
-async def stop_tunnel_engine():
-    if not state.is_running or not state.process:
-        return
-
-    state.append_log("[Manager] Terminating engine...")
     try:
-        state.process.terminate()
-        await asyncio.wait_for(state.process.wait(), timeout=3.0)
-    except asyncio.TimeoutError:
-        state.process.kill()
-        state.append_log("[Manager] Engine force killed.")
+        if sys.platform == "win32":
+            proc.terminate()
+        else:
+            os.kill(proc.pid, signal.SIGTERM)
+
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            if proc.poll() is not None:
+                break
+        else:
+            proc.kill()
     except Exception as e:
-        state.append_log(f"[Manager Error] Stop error: {e}")
+        print(f"Error terminating process: {e}")
     finally:
-        state.process = None
-        ui.update()
+        await state.stop()
+        render_header.refresh()
+        render_config_list.refresh()
+        ui.notify("Tunnel stopped", type="info")
 
+async def read_tunnel_logs(proc: subprocess.Popen):
+    """Asynchronously stream stdout lines from process to live UI log."""
+    loop = asyncio.get_running_loop()
+    proc_ref = proc
 
-async def exit_application():
-    await stop_tunnel_engine()
-    notice = state.t("exit_notice")
-    ui.run_javascript(f'''
-        document.body.style.backgroundColor = "white";
-        document.body.innerHTML = "<div style='display: flex; justify-content: center; align-items: center; height: 100vh; font-size: 20px; color: #333; font-family: sans-serif; font-weight: bold;'>{notice}</div>";
-    ''')
-    await asyncio.sleep(0.5)
-    os._exit(0)
+    while proc_ref.poll() is None:
+        try:
+            line = await loop.run_in_executor(None, lambda: proc_ref.stdout.readline() if proc_ref.stdout else "")
+        except asyncio.CancelledError:
+            break
 
+        if line:
+            clean_line = line.strip()
+            if log_view:
+                log_view.push(clean_line)
+            log_buffer.append(clean_line)
+            if len(log_buffer) > 2000:
+                log_buffer.pop(0)
+        else:
+            await asyncio.sleep(0.1)
 
-# ============================================================================
-# Dynamic Refreshable UI Components
-# ============================================================================
-@ui.refreshable
-def render_config_list():
-    for cfg_name in list(state.configs.keys()):
-        is_active = (cfg_name == state.active_config_name)
-        
-        with ui.row().classes(f'w-full items-center justify-between p-2 rounded cursor-pointer transition-colors {"bg-blue-50 dark:bg-slate-800" if is_active else "hover:bg-slate-200 dark:hover:bg-slate-800"}'):
-            ui.label(cfg_name).classes('font-medium text-sm truncate max-w-[140px]') \
-                .on('click', lambda _, name=cfg_name: select_config(name))
-            
-            with ui.row().classes('items-center gap-1'):
-                if len(state.configs) > 1:
-                    ui.button(icon='delete', on_click=lambda _, name=cfg_name: confirm_delete_config(name)) \
-                        .props('flat round dense size=sm color=negative')
-
-
-@ui.refreshable
-def render_config_form():
-    cfg = state.configs.get(state.active_config_name, DEFAULT_CLIENT_CONFIG.copy())
-
-    ui.label().bind_text_from(state, 'active_config_name', lambda n: f"Config: {n}").classes('text-xl font-bold mb-2')
-
-    with ui.grid(columns=2).classes('w-full gap-4'):
-        role_select = ui.select(
-            options=["client", "server"],
-            value=cfg.get("role", "client"),
-            label=state.t("role")
-        ).classes('w-full').props('outlined')
-
-        server_addr_input = ui.input(
-            label=state.t("server_addr"),
-            value=cfg.get("server_addr", "127.0.0.1:8443")
-        ).classes('w-full').props('outlined')
-
-        psk_input = ui.input(
-            label=state.t("psk"),
-            value=cfg.get("psk", ""),
-            password=True,
-            password_toggle_button=True
-        ).classes('w-full').props('outlined')
-
-        socks_port_input = ui.number(
-            label=state.t("socks_port"),
-            value=cfg.get("socks_port", 1080),
-            format='%d'
-        ).classes('w-full').props('outlined')
-
-        http_port_input = ui.number(
-            label=state.t("http_port"),
-            value=cfg.get("http_port", 8080),
-            format='%d'
-        ).classes('w-full').props('outlined')
-
-        fec_enabled_init = cfg.get("fec_data_shards", 0) > 0 and cfg.get("fec_parity_shards", 0) > 0
-        fec_switch = ui.switch(
-            text=state.t("fec_enable"),
-            value=fec_enabled_init
-        ).classes('col-span-2 font-medium')
-
-        fec_n_input = ui.number(
-            label=state.t("fec_n"),
-            value=cfg.get("fec_data_shards", 12) if fec_enabled_init else 12,
-            format='%d'
-        ).classes('w-full').props('outlined')
-
-        fec_m_input = ui.number(
-            label=state.t("fec_m"),
-            value=cfg.get("fec_parity_shards", 4) if fec_enabled_init else 4,
-            format='%d'
-        ).classes('w-full').props('outlined')
-
-        max_streams_input = ui.number(
-            label=state.t("max_streams"),
-            value=cfg.get("max_concurrent_streams", 1024),
-            format='%d'
-        ).classes('w-full').props('outlined')
-
-        log_level_select = ui.select(
-            options=["debug", "info", "warning", "error"],
-            value=cfg.get("log_level", "info"),
-            label=state.t("log_level")
-        ).classes('w-full').props('outlined')
-
-    def handle_role_change(e):
-        is_client = (e.value == "client")
-        socks_port_input.set_visibility(is_client)
-        http_port_input.set_visibility(is_client)
-
-    def handle_fec_toggle(e):
-        fec_n_input.set_visibility(e.value)
-        fec_m_input.set_visibility(e.value)
-
-    role_select.on_value_change(handle_role_change)
-    handle_role_change(type('Ev', (), {'value': role_select.value}))
-
-    fec_switch.on_value_change(handle_fec_toggle)
-    handle_fec_toggle(type('Ev', (), {'value': fec_switch.value}))
-
-    def save_action():
-        updated_cfg = {
-            "role": role_select.value,
-            "server_addr": server_addr_input.value,
-            "psk": psk_input.value,
-            "fec_data_shards": int(fec_n_input.value or 0) if fec_switch.value else 0,
-            "fec_parity_shards": int(fec_m_input.value or 0) if fec_switch.value else 0,
-            "max_concurrent_streams": int(max_streams_input.value or 1024),
-            "log_level": log_level_select.value,
-        }
-        if role_select.value == "client":
-            updated_cfg["socks_port"] = int(socks_port_input.value or 1080)
-            updated_cfg["http_port"] = int(http_port_input.value or 8080)
-
-        state.configs[state.active_config_name] = updated_cfg
-        state.save_config_file(state.active_config_name, updated_cfg)
-        ui.notify(state.t("msg_saved"), type='positive')
-
-    ui.button(icon='save', on_click=save_action) \
-        .bind_text_from(state, 'lang', lambda _: state.t('save')) \
-        .props('color=primary unelevated').classes('mt-4')
-
-
-# ============================================================================
-# GUI Layout & Actions
-# ============================================================================
-@ui.page('/')
-def main_page():
-    ui.colors(primary='#2563EB', secondary='#475569', accent='#10B981')
-
-    # Header
-    with ui.header().classes('items-center justify-between bg-slate-800 text-white px-6 py-3'):
-        with ui.row().classes('items-center gap-3'):
-            ui.icon('lan', size='md').classes('text-blue-400')
-            ui.label().bind_text_from(state, 'lang', lambda _: state.t("title")).classes('text-lg font-bold')
-
-            with ui.badge().bind_visibility_from(state, 'is_running').classes('bg-emerald-500 text-white px-2 py-1'):
-                ui.label().bind_text_from(state, 'lang', lambda _: f"● {state.t('status_running')}")
-            with ui.badge().bind_visibility_from(state, 'is_running', backward=lambda r: not r).classes('bg-rose-500 text-white px-2 py-1'):
-                ui.label().bind_text_from(state, 'lang', lambda _: f"○ {state.t('status_stopped')}")
-
-        with ui.row().classes('items-center gap-4'):
-            def on_lang_change(e):
-                state.lang = e.value
-                render_config_list.refresh()
-                render_config_form.refresh()
-
-            ui.select(
-                options={"en": "English", "zh-CN": "简体中文", "zh-TW": "繁體中文"},
-                value=state.lang,
-                on_change=on_lang_change
-            ).props('dense options-dense dark').classes('w-32')
-
-            ui.button(
-                text="",
-                icon="play_arrow",
-                on_click=start_tunnel_engine
-            ).bind_text_from(state, 'lang', lambda _: state.t('start')) \
-             .bind_visibility_from(state, 'is_running', backward=lambda r: not r) \
-             .props('color=emerald unelevated')
-
-            ui.button(
-                text="",
-                icon="stop",
-                on_click=stop_tunnel_engine
-            ).bind_text_from(state, 'lang', lambda _: state.t('stop')) \
-             .bind_visibility_from(state, 'is_running') \
-             .props('color=rose unelevated')
-
-            ui.button(
-                text="",
-                icon="power_settings_new",
-                on_click=confirm_exit_app
-            ).bind_text_from(state, 'lang', lambda _: state.t('exit_app')) \
-             .props('color=grey-8 unelevated')
-
-    # Main Grid
-    with ui.row().classes('w-full h-[calc(100vh-65px)] no-wrap gap-0'):
-        # Drawer
-        with ui.column().classes('w-72 bg-slate-100 dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 p-4 gap-2 h-full'):
-            with ui.row().classes('w-full items-center justify-between mb-2'):
-                ui.label().bind_text_from(state, 'lang', lambda _: state.t('configs')).classes('font-semibold text-slate-700 dark:text-slate-300')
-                ui.button(icon='add', on_click=open_add_config_dialog).props('flat round dense color=primary')
-
-            with ui.column().classes('w-full gap-1 overflow-y-auto flex-grow'):
-                render_config_list()
-
-        # Content Area
-        with ui.column().classes('flex-grow h-full p-6 bg-white dark:bg-slate-950 overflow-y-auto'):
-            with ui.tabs().classes('w-full') as tabs:
-                tab_config = ui.tab('cfg_tab', icon='settings').bind_label_from(state, 'lang', lambda _: state.t('tab_config'))
-                tab_logs = ui.tab('log_tab', icon='terminal').bind_label_from(state, 'lang', lambda _: state.t('tab_logs'))
-
-            with ui.tab_panels(tabs, value=tab_config).classes('w-full mt-4 flex-grow'):
-                # Config Panel
-                with ui.tab_panel(tab_config):
-                    with ui.column().classes('w-full max-w-3xl gap-4'):
-                        render_config_form()
-
-                # Logs Panel
-                with ui.tab_panel(tab_logs):
-                    with ui.row().classes('w-full items-center justify-between mb-2'):
-                        with ui.row().classes('gap-2'):
-                            ui.button(icon='clear_all', on_click=clear_logs_action) \
-                                .bind_text_from(state, 'lang', lambda _: state.t('clear_logs')) \
-                                .props('outline dense color=secondary')
-                            ui.button(icon='download', on_click=export_logs_action) \
-                                .bind_text_from(state, 'lang', lambda _: state.t('export_logs')) \
-                                .props('outline dense color=primary')
-                        
-                    log_widget = ui.log(max_lines=MAX_LOG_LINES).classes('w-full h-[calc(100vh-220px)] bg-slate-900 text-green-400 font-mono text-xs p-4 rounded')
-                    state.log_widget = log_widget
-                    for line in state.log_buffer:
-                        log_widget.push(line)
-
-
-def select_config(name: str):
-    if state.is_running:
-        ui.notify("Stop the tunnel before changing active config.", type='warning')
-        return
-    state.active_config_name = name
-    render_config_list.refresh()
-    render_config_form.refresh()
-
-
-def clear_logs_action():
-    state.log_buffer.clear()
-    if state.log_widget:
-        state.log_widget.clear()
-
-
-def export_logs_action():
-    if not state.log_buffer:
-        ui.notify("Log buffer is empty.", type='warning')
-        return
-    content = "\n".join(state.log_buffer)
-    ui.download(content.encode('utf-8'), "lightcone_export.log")
-
+    if state.is_running and state.process == proc_ref:
+        await state.stop()
+        render_header.refresh()
+        render_config_list.refresh()
 
 def open_add_config_dialog():
-    if len(state.configs) >= 10:
-        ui.notify(state.t("err_max_configs"), type='warning')
-        return
+    """Render Material You dialog to add a new YAML configuration file."""
+    default_template = """# Lightcone Tunnel Client Configuration
+role: "client"
+server_addr: "127.0.0.1:8443"
+psk: "YourStrongSecretPSKKeyHere"
+socks_port: 1080
+http_port: 8080
+fec_data_shards: 12
+fec_parity_shards: 4
+max_concurrent_streams: 1024
+log_level: "info"
+"""
 
-    dialog = ui.dialog()
-    with dialog, ui.card().classes('w-96 p-4 gap-4'):
-        ui.label(state.t("add_config")).classes('text-lg font-bold')
-        name_input = ui.input(label=state.t("dialog_name_placeholder")).classes('w-full').props('outlined')
+    with ui.dialog() as dialog, ui.card().classes(
+        "w-[500px] p-6 rounded-3xl bg-[#1d2026] text-gray-100 shadow-2xl border border-[#313745] gap-4"
+    ):
+        ui.label(t("add_config")).classes("text-xl font-bold tracking-tight text-[#a8c7fa] mb-1")
 
-        with ui.row().classes('w-full justify-end gap-2'):
-            ui.button(state.t('cancel'), on_click=dialog.close).props('flat')
-            
-            def create_config():
-                val = name_input.value.strip()
-                if not val or len(val) > 20:
-                    ui.notify(state.t("err_name_len"), type='negative')
-                    return
-                if re.search(r'[\\/:*?"<>|]', val):
-                    ui.notify(state.t("err_invalid_chars"), type='negative')
-                    return
-                if val in state.configs:
-                    ui.notify(state.t("err_name_exists"), type='warning')
-                    return
+        name_input = ui.input(
+            label=t("config_name"),
+            placeholder="e.g. node_hk"
+        ).classes("w-full").props("outlined dark rounded")
 
-                state.configs[val] = DEFAULT_CLIENT_CONFIG.copy()
-                state.save_config_file(val, DEFAULT_CLIENT_CONFIG)
-                state.active_config_name = val
+        content_input = ui.textarea(
+            label=t("config_content"),
+            value=default_template
+        ).classes("w-full h-48 font-mono text-xs").props("outlined dark rounded")
+
+        def save_file(target_path: Path, fname: str, raw_content: str, parent_dialog):
+            try:
+                yaml.safe_load(raw_content)
+            except yaml.YAMLError as e:
+                ui.notify(f"Invalid YAML format: {e}", type="negative")
+                return
+
+            try:
+                with open(target_path, "w", encoding="utf-8") as f:
+                    f.write(raw_content)
+                ui.notify(f"Config '{fname}' saved.", type="positive")
+                parent_dialog.close()
                 render_config_list.refresh()
-                render_config_form.refresh()
-                dialog.close()
+                ui.update()
+            except Exception as e:
+                ui.notify(f"Failed to save file: {e}", type="negative")
 
-            ui.button(state.t('create'), on_click=create_config).props('unelevated color=primary')
+        def create_file():
+            fname = name_input.value.strip()
+            if not fname:
+                ui.notify("Configuration name cannot be empty.", type="warning")
+                return
+
+            if re.search(r'[\/:*?"<>|]', fname):
+                ui.notify(t("invalid_filename"), type="warning")
+                return
+
+            if not fname.endswith((".yaml", ".yml")):
+                fname += ".yaml"
+
+            target_path = CONFIGS_DIR / fname
+
+            if target_path.exists():
+                with ui.dialog() as confirm_dialog, ui.card().classes(
+                    "p-5 gap-4 bg-[#1d2026] text-gray-100 border border-[#313745] rounded-3xl"
+                ):
+                    ui.label(f"File '{fname}' already exists. Overwrite?").classes("text-base font-medium text-gray-200")
+                    with ui.row().classes("w-full justify-end gap-2"):
+                        ui.button(t("cancel"), on_click=confirm_dialog.close).props("flat color=grey")
+                        def do_overwrite():
+                            confirm_dialog.close()
+                            save_file(target_path, fname, content_input.value, dialog)
+                        ui.button("Overwrite", on_click=do_overwrite).classes("bg-[#f2b8b5] text-[#601410] font-bold rounded-full px-4 py-1")
+                confirm_dialog.open()
+                return
+
+            save_file(target_path, fname, content_input.value, dialog)
+
+        with ui.row().classes("w-full justify-end gap-3 mt-2"):
+            ui.button(t("cancel"), on_click=dialog.close).props("flat rounded color=grey")
+            ui.button(t("save"), on_click=create_file).classes("bg-[#a8c7fa] text-[#062e6f] font-medium rounded-full px-6 py-2")
 
     dialog.open()
 
-
-def confirm_delete_config(name: str):
+def open_delete_config_dialog(cfg_name: str):
+    """Render confirmation dialog to delete a configuration file directly from disk with error catching and UI force refresh."""
     if state.is_running:
-        ui.notify(state.t("err_delete_running"), type='warning')
+        ui.notify(t("switch_warn"), type="warning")
         return
 
-    dialog = ui.dialog()
-    with dialog, ui.card().classes('p-4 gap-4'):
-        ui.label(state.t("confirm_delete")).classes('text-base')
-        with ui.row().classes('w-full justify-end gap-2'):
-            ui.button(state.t('cancel'), on_click=dialog.close).props('flat')
-            
-            def do_delete():
-                dialog.close()
-                state.delete_config_file(name)
-                state.configs.pop(name, None)
-                if state.active_config_name == name:
-                    state.active_config_name = next(iter(state.configs.keys()), "")
-                render_config_list.refresh()
-                render_config_form.refresh()
-                ui.notify(state.t("msg_deleted"), type='info')
+    with ui.dialog() as dialog, ui.card().classes(
+        "w-[400px] p-6 rounded-3xl bg-[#1d2026] text-gray-100 shadow-2xl border border-[#313745] gap-4 text-center"
+    ):
+        ui.label(t("delete_config")).classes("text-xl font-bold text-[#f2b8b5] mb-1")
+        ui.label(t("delete_confirm").format(fname=cfg_name)).classes("text-sm text-gray-300")
 
-            ui.button(state.t('delete'), on_click=do_delete).props('unelevated color=negative')
+        def confirm_delete():
+            dialog.close()
+            deleted_any = False
+            target_files = [
+                p for p in CONFIGS_DIR.iterdir()
+                if p.is_file() and p.stem == cfg_name and p.suffix.lower() in ['.yaml', '.yml']
+            ]
+
+            if not target_files:
+                ui.notify(f"Config '{cfg_name}' not found on disk.", type="warning")
+            else:
+                for target_path in target_files:
+                    try:
+                        target_path.unlink()
+                        deleted_any = True
+                    except PermissionError:
+                        ui.notify(f"Config '{cfg_name}' is locked by another process. Please close any editor.", type="negative")
+                        return
+                    except Exception as e:
+                        ui.notify(f"Failed to delete config: {e}", type="negative")
+                        return
+
+            if deleted_any:
+                ui.notify(f"Config '{cfg_name}' deleted.", type="positive")
+
+            remaining = get_config_files()
+            if state.active_config == cfg_name:
+                state.active_config = remaining[0] if remaining else ""
+
+            if app_settings.get("default_config") == cfg_name:
+                app_settings["default_config"] = remaining[0] if remaining else ""
+                save_settings(app_settings)
+
+            render_header.refresh()
+            render_config_list.refresh()
+            ui.update()
+
+        with ui.row().classes("w-full justify-center gap-4 mt-2"):
+            ui.button(t("cancel"), on_click=dialog.close).props("flat rounded color=grey")
+            ui.button(t("delete"), on_click=confirm_delete).classes("bg-[#f2b8b5] text-[#601410] font-bold rounded-full px-6 py-2")
 
     dialog.open()
 
+def open_exit_dialog():
+    """Render confirmation dialog to exit application safely with loading overlay."""
+    with ui.dialog() as dialog, ui.card().classes(
+        "w-[400px] p-6 rounded-3xl bg-[#1d2026] text-gray-100 shadow-2xl border border-[#313745] gap-4 text-center"
+    ):
+        ui.label(t("exit_app")).classes("text-xl font-bold text-[#f2b8b5] mb-1")
+        ui.label(t("exit_confirm")).classes("text-sm text-gray-300")
 
-def confirm_exit_app():
-    dialog = ui.dialog()
-    with dialog, ui.card().classes('p-4 gap-4'):
-        ui.label(state.t("confirm_exit")).classes('text-base')
-        with ui.row().classes('w-full justify-end gap-2'):
-            ui.button(state.t('cancel'), on_click=dialog.close).props('flat')
-            
-            async def do_exit():
-                dialog.close()
-                await exit_application()
+        async def confirm_exit():
+            dialog.close()
+            with ui.dialog() as loading_dialog, ui.card().classes(
+                "p-6 rounded-3xl bg-[#1d2026] text-gray-100 border border-[#313745] text-center gap-2"
+            ):
+                ui.icon("hourglass_empty", size="2.5rem").classes("text-[#a8c7fa] mx-auto animate-spin")
+                ui.label(t("exit_app")).classes("text-lg font-bold text-center mt-2")
+                ui.label(t("exiting_notice")).classes("text-sm text-gray-400 text-center")
+            loading_dialog.open()
 
-            ui.button(state.t('exit_app'), on_click=do_exit).props('unelevated color=negative')
+            await asyncio.sleep(0.2)
+            try:
+                await stop_tunnel()
+            except Exception:
+                pass
+            release_instance_lock()
+            os._exit(0)
+
+        with ui.row().classes("w-full justify-center gap-4 mt-2"):
+            ui.button(t("cancel"), on_click=dialog.close).props("flat rounded color=grey")
+            ui.button(t("exit_app"), on_click=confirm_exit).classes("bg-[#f2b8b5] text-[#601410] font-bold rounded-full px-6 py-2")
 
     dialog.open()
 
+def open_settings_dialog():
+    """Render Material You dialog for application settings."""
+    configs = get_config_files()
+    cur_default = app_settings.get("default_config", state.active_config)
+    selected_value = cur_default if cur_default in configs else (configs[0] if configs else None)
 
-# ============================================================================
-# Application Entry Point (Browser Mode)
-# ============================================================================
-if __name__ in {"__main__", "__mp_main__"}:
-    app.on_shutdown(stop_tunnel_engine)
+    with ui.dialog() as dialog, ui.card().classes(
+        "w-[460px] p-6 rounded-3xl bg-[#1d2026] text-gray-100 shadow-2xl border border-[#313745] gap-4"
+    ):
+        ui.label(t("settings")).classes("text-xl font-bold tracking-tight text-[#a8c7fa] mb-1")
 
-    ui.run(
-        title="Lightcone Tunnel Manager",
-        port=8000,
-        reload=False,
-        show=True,
-        native=False,
-    )
+        host_input = ui.input(
+            label=t("host"),
+            value=app_settings.get("gui_host", "127.0.0.1")
+        ).classes("w-full").props("outlined dark rounded")
+
+        port_input = ui.number(
+            label=t("port"),
+            value=app_settings.get("gui_port", 8000),
+            format="%d"
+        ).classes("w-full").props("outlined dark rounded")
+
+        ui.label(t("restart_notice")).classes("text-xs text-amber-400 -mt-2 mb-2")
+
+        auto_start_switch = ui.switch(
+            t("auto_start"),
+            value=app_settings.get("auto_start_enabled", False)
+        ).classes("text-sm text-gray-200")
+
+        default_config_select = ui.select(
+            options=configs if configs else [],
+            value=selected_value,
+            label=t("default_config")
+        ).classes("w-full").props("outlined dark rounded")
+
+        lang_select = ui.select(
+            options={"zh-CN": "简体中文", "zh-TW": "繁體中文", "en": "English"},
+            value=state.lang,
+            label="Language / 语言"
+        ).classes("w-full").props("outlined dark rounded")
+
+        def save():
+            app_settings["gui_host"] = str(host_input.value).strip() or "127.0.0.1"
+            try:
+                app_settings["gui_port"] = int(port_input.value)
+            except ValueError:
+                app_settings["gui_port"] = 8000
+            app_settings["auto_start_enabled"] = bool(auto_start_switch.value)
+            app_settings["default_config"] = str(default_config_select.value) if default_config_select.value else ""
+            state.lang = str(lang_select.value)
+            app_settings["language"] = state.lang
+
+            save_settings(app_settings)
+            dialog.close()
+            ui.notify(t("saved_toast"), type="positive")
+
+            render_header.refresh()
+            render_config_list.refresh()
+            ui.update()
+
+        with ui.row().classes("w-full justify-end gap-3 mt-4"):
+            ui.button(t("cancel"), on_click=dialog.close).props("flat rounded color=grey")
+            ui.button(t("save"), on_click=save).classes("bg-[#a8c7fa] text-[#062e6f] font-medium rounded-full px-6 py-2")
+
+    dialog.open()
+
+@ui.refreshable
+def render_header():
+    """Render Material You Top Navigation Bar."""
+    with ui.row().classes("w-full bg-[#171c26] text-white px-6 py-4 rounded-3xl mb-6 border border-[#2b313e] items-center justify-between shadow-sm"):
+        with ui.row().classes("items-center gap-3"):
+            ui.icon("hub").classes("text-3xl text-[#a8c7fa]")
+            with ui.column().classes("gap-0"):
+                ui.label(t("title")).classes("text-xl font-bold tracking-tight text-gray-100")
+                ui.label(f"{t('current_config')}: {state.active_config or 'N/A'}").classes("text-xs text-gray-400 font-mono")
+
+        with ui.row().classes("items-center gap-3"):
+            if state.is_running:
+                with ui.row().classes("bg-[#81c995]/20 text-[#81c995] border border-[#81c995]/40 rounded-full px-3.5 py-1.5 items-center gap-2"):
+                    ui.icon("sensors").classes("text-sm animate-pulse")
+                    ui.label(t("running")).classes("font-semibold text-xs tracking-wide")
+            else:
+                with ui.row().classes("bg-[#f2b8b5]/20 text-[#f2b8b5] border border-[#f2b8b5]/40 rounded-full px-3.5 py-1.5 items-center gap-2"):
+                    ui.icon("sensors_off").classes("text-sm")
+                    ui.label(t("stopped")).classes("font-semibold text-xs tracking-wide")
+
+            if state.is_running:
+                ui.button(
+                    t("stop"),
+                    icon="power_settings_new",
+                    on_click=stop_tunnel
+                ).classes("bg-[#f2b8b5] text-[#601410] font-semibold rounded-full px-6 py-2 hover:bg-[#f9dada] transition-all")
+            else:
+                ui.button(
+                    t("start"),
+                    icon="play_arrow",
+                    on_click=start_tunnel
+                ).classes("bg-[#a8c7fa] text-[#062e6f] font-semibold rounded-full px-6 py-2 hover:bg-[#bdcffc] transition-all")
+
+            ui.button(icon="settings", on_click=open_settings_dialog).props("flat round text-color=white").classes("hover:bg-[#282f3d]").tooltip(t("settings"))
+            ui.button(icon="logout", on_click=open_exit_dialog).props("flat round text-color=red-4").classes("hover:bg-[#282f3d]").tooltip(t("exit_app"))
+
+@ui.refreshable
+def render_config_list():
+    """Render configuration card list with M3 geometry."""
+    configs = get_config_files()
+
+    with ui.row().classes("w-full items-center justify-between mb-3 px-1"):
+        ui.label(t("configs")).classes("text-sm font-semibold tracking-wider text-gray-400 uppercase")
+        with ui.row().classes("items-center gap-1"):
+            ui.button(icon="add", on_click=open_add_config_dialog).props("flat round dense text-color=grey-4").tooltip(t("add_config"))
+            ui.button(icon="refresh", on_click=render_config_list.refresh).props("flat round dense text-color=grey-4").tooltip(t("refresh"))
+
+    if not configs:
+        ui.label(t("no_configs")).classes("text-gray-400 text-sm italic p-4 bg-[#171c26] rounded-2xl border border-[#2b313e] w-full")
+        return
+
+    with ui.column().classes("w-full gap-3"):
+        for cfg in configs:
+            is_active = (cfg == state.active_config)
+
+            card_classes = "w-full p-4 rounded-2xl transition-all duration-200 cursor-pointer flex items-center justify-between border "
+            if is_active:
+                card_classes += "bg-[#252c3a] border-[#a8c7fa] shadow-md "
+            else:
+                card_classes += "bg-[#171c26] border-[#2b313e] hover:bg-[#202634] "
+
+            if state.is_running and not is_active:
+                card_classes += "opacity-50 cursor-not-allowed "
+
+            with ui.card().classes(card_classes).on("click", lambda _, c=cfg: asyncio.create_task(select_config(c))):
+                with ui.row().classes("items-center gap-3"):
+                    icon_name = "tune" if is_active else "description"
+                    icon_color = "text-[#a8c7fa]" if is_active else "text-gray-400"
+                    ui.icon(icon_name).classes(f"text-xl {icon_color}")
+                    ui.label(cfg).classes("font-medium text-base text-gray-100")
+
+                with ui.row().classes("items-center gap-2"):
+                    if is_active:
+                        ui.badge(t("active")).classes("bg-[#a8c7fa] text-[#062e6f] font-bold text-xs px-3 py-1 rounded-full")
+
+                    del_btn = ui.button(icon="delete").props("flat round dense text-color=grey-5").classes("hover:text-red-400").tooltip(t("delete_config"))
+                    if state.is_running:
+                        del_btn.props("disabled")
+                    else:
+                        del_btn.on("click.stop", lambda _, c=cfg: open_delete_config_dialog(c))
+
+@ui.page("/")
+def main_page():
+    """Main Application Layout Page."""
+    global log_view
+
+    ui.add_head_html("""
+        <style>
+            body {
+                background-color: #0f131a;
+                color: #e2e2e9;
+                font-family: 'Roboto', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            }
+            .q-field--outlined .q-field__control {
+                border-radius: 12px !important;
+            }
+        </style>
+    """)
+
+    with ui.column().classes("w-full max-w-7xl mx-auto p-4 md:p-6 min-h-screen gap-0"):
+        render_header()
+
+        with ui.row().classes("w-full gap-6 items-start flex-col md:flex-row"):
+            with ui.column().classes("w-full md:w-80 flex-shrink-0"):
+                render_config_list()
+
+            with ui.column().classes("w-full flex-1 gap-3"):
+                with ui.row().classes("w-full items-center justify-between px-1"):
+                    ui.label(t("logs")).classes("text-sm font-semibold tracking-wider text-gray-400 uppercase")
+                    ui.button(
+                        icon="delete_sweep",
+                        on_click=lambda: log_view.clear() if log_view else None
+                    ).bind_text_from(state, 'lang', lambda _: t("clear_logs")).props("flat dense text-color=grey-4").classes("text-xs")
+
+                with ui.card().classes("w-full p-3 bg-[#171c26] rounded-3xl border border-[#2b313e] shadow-sm"):
+                    log_view = ui.log(max_lines=2000).classes(
+                        "w-full h-[540px] bg-[#0c0e12] text-green-400 font-mono text-xs p-4 rounded-2xl border border-[#202530]"
+                    )
+                    for line in log_buffer:
+                        log_view.push(line)
+
+    if app_settings.get("auto_start_enabled", False):
+        ui.timer(0.5, start_tunnel, once=True)
+
+def is_port_available(port: int, host: str = "127.0.0.1") -> bool:
+    """Check if a port is available for binding before starting UI."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(1.0)
+            s.bind((host, port))
+            return True
+    except OSError:
+        return False
+
+# Application Entry Point
+gui_host = app_settings.get("gui_host", "127.0.0.1")
+gui_port = app_settings.get("gui_port", 8000)
+
+if not is_port_available(gui_port, gui_host):
+    print(f"\n❌ Error: Port {gui_port} is already in use on {gui_host}.")
+    print(f"   Please stop the process using port {gui_port} or change the port in settings.")
+    print(f"\n   To check which process is using the port:")
+    print(f"   • Linux/macOS: sudo lsof -i :{gui_port}")
+    print(f"   • Windows: netstat -ano | findstr :{gui_port}")
+    print(f"\n   To change the port, edit manager_settings.yaml and restart.\n")
+    sys.exit(1)
+
+ui.run(
+    host=gui_host,
+    port=gui_port,
+    title="Lightcone Console",
+    dark=True,
+    reload=False,
+    storage_secret="lightcone_manager_secret_key"
+)
