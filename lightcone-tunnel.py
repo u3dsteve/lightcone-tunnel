@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Lightcone Tunnel - High-Performance Anti-DPI UDP Tunnel & Proxy Solution
-Production Release v4.2.2 (Memory-Aware Adaptive Engine & Strict Defenses)
+Production Release v4.2.6 (Edge-Case Hardened & Zombie Defense)
 """
 
 import argparse
@@ -32,26 +32,21 @@ except ImportError:
 # Memory Profile & Dynamic Tuning Engine
 # ============================================================================
 class MemoryProfile:
-    """智能内存动态调节引擎：根据配置的物理内存和延迟，自适应推导最佳网络参数"""
     def __init__(self, mem_mb: int, latency_ms: int = 100):
-        self.mem_mb = max(mem_mb, 512)
-        self.latency_ms = max(latency_ms, 10)  # 防止除 0
+        self.mem_mb = max(int(mem_mb), 512)
+        self.latency_ms = max(int(latency_ms), 10)
         multiplier = self.mem_mb / 512.0
         
-        # 基础容量推导
         self.max_streams = min(int(512 * multiplier), 16384)
         self.max_window_packets = min(int(2048 * multiplier), 16384)
         self.idle_timeout = 120.0 if self.mem_mb <= 512 else min(120.0 * multiplier, 300.0)
         
-        # 底层缓冲区推导
         self.udp_buf_size = min(int(8388608 * multiplier), 33554432)
         self.tcp_buf_limit = min(int(1048576 * multiplier), 8388608)
         
-        # 乱序深水区和防重放字典
         self.assembler_buf_len = min(int(2048 * multiplier), 16384)
         self.seen_seq_limit = min(int(4000 * multiplier), 32000)
 
-        # 根据延迟动态推导时间/超时参数，取代硬编码
         self.assembler_timeout = max(15.0, min(60.0, self.latency_ms / 100.0 * 15.0))
         self.fec_timeout = max(0.5, min(5.0, self.latency_ms / 1000.0 * 10.0))
         self.fec_flush_interval = max(0.010, min(0.050, self.latency_ms / 5000.0))
@@ -59,17 +54,17 @@ class MemoryProfile:
         self.nack_cooldown_slow = self.nack_cooldown * 2.0
 
     def apply_user_config(self, user_streams: Optional[int]):
-        # 【修复】严格区分 None 和 0，防止 max_concurrent_streams: 0 穿透
-        if user_streams is None:
-            return
+        if user_streams is None: return
+        user_streams = int(user_streams)
         if user_streams <= 0:
             logging.warning("[Memory] max_concurrent_streams is 0. Engine will reject all new connections.")
-            self.max_streams = 0
-            return
+            self.max_streams = 0; return
             
         if user_streams > self.max_streams:
-            logging.warning(f"[Memory] User max_concurrent_streams ({user_streams}) exceeds memory-derived limit ({self.max_streams}). Downscaling buffers to prevent OOM.")
-            ratio = self.max_streams / user_streams
+            user_streams = min(user_streams, 65535) # OS port limit hard cap
+            logging.warning(f"[Memory] User max_concurrent_streams ({user_streams}) exceeds safe limit ({self.max_streams}). Downscaling buffers safely.")
+            # [Fix] Prevent extreme buffer squash if user inputs 999999
+            ratio = max(0.1, self.max_streams / user_streams) 
             self.max_window_packets = max(256, int(self.max_window_packets * ratio))
             self.assembler_buf_len = max(256, int(self.assembler_buf_len * ratio))
             self.tcp_buf_limit = max(131072, int(self.tcp_buf_limit * ratio))
@@ -78,7 +73,6 @@ class MemoryProfile:
     def print_profile(self):
         logging.info(f"[Memory Tuner] Configured RAM: {self.mem_mb} MB | Expected Latency: {self.latency_ms} ms")
         logging.info(f"[Memory Tuner] Max Streams: {self.max_streams} | Window Cap: {self.max_window_packets} Pkts")
-        logging.info(f"[Memory Tuner] TCP/UDP Buf: {self.tcp_buf_limit//1024}KB/{self.udp_buf_size//1024}KB | Timeout: {self.assembler_timeout:.1f}s")
 
 
 # ============================================================================
@@ -99,10 +93,6 @@ MAX_PAYLOAD_SIZE = 1000
 TIMESTAMP_TOLERANCE_SEC = 30.0 
 CONNECT_TIMEOUT_SEC = 10.0     
 HEARTBEAT_INTERVAL_SEC = 20.0  
-
-
-def get_chunk_size() -> int:
-    return MAX_PAYLOAD_SIZE
 
 
 class StreamCtx:
@@ -177,17 +167,22 @@ class FECGroupEncoder:
         self.n, self.m = data_shards, parity_shards
         self.mem = mem
         self.group_id = 0; self.buffer = []; self.last_act = time.time()
-        # 【修复】利用 m 的最高位 (0x80) 来标记当前是否启用了 zfec 编码
         self.m_encoded = self.m | 0x80 if zfec else self.m
 
     def input_packet(self, ciphertext: bytes) -> List[bytes]:
         if self.n <= 0 or self.m <= 0: return [ciphertext]
         now = time.time()
         out = []
-        if self.buffer and (now - self.last_act > self.mem.fec_flush_interval): out.extend(self._flush())
-        self.last_act = now; idx = len(self.buffer); self.buffer.append(ciphertext)
+        if self.buffer and (now - self.last_act > self.mem.fec_flush_interval): 
+            out.extend(self._flush())
+            
+        self.last_act = now
+        idx = len(self.buffer)
         
-        out.append(struct.pack("!QBBBH", self.group_id, idx, self.n, self.m_encoded, len(ciphertext)) + ciphertext)
+        fec_payload = struct.pack("!H", len(ciphertext)) + ciphertext
+        self.buffer.append(fec_payload)
+        
+        out.append(struct.pack("!QBBBH", self.group_id, idx, self.n, self.m_encoded, len(fec_payload)) + fec_payload)
         if len(self.buffer) == self.n: out.extend(self._flush())
         return out
 
@@ -203,7 +198,10 @@ class FECGroupEncoder:
 
         for p_idx, p_data in enumerate(parity_blocks, start=self.n):
             out.append(struct.pack("!QBBBH", self.group_id, p_idx, self.n, self.m_encoded, max_len) + p_data)
-        self.group_id = (self.group_id + 1) & 0xFFFFFFFFFFFFFFFF; self.buffer.clear()
+        
+        self.group_id = (self.group_id + 1) & 0xFFFFFFFFFFFFFFFF
+        self.buffer.clear()
+        self.last_act = time.time()
         return out
 
 class FECGroupDecoder:
@@ -215,44 +213,45 @@ class FECGroupDecoder:
     def process_datagram(self, peer_addr, datagram: bytes, fec_enabled: bool) -> List[bytes]:
         if not fec_enabled or len(datagram) < 13: return [datagram]
         group_id, idx, n, m_raw, raw_len = struct.unpack("!QBBBH", datagram[:13])
-        
-        # 【修复】解开 m 的最高位，精准识别对方使用的编码方式
         use_zfec = bool(m_raw & 0x80)
         m = m_raw & 0x7F
         
-        payload = datagram[13:]
+        payload = datagram[13:13+raw_len]
         key = (peer_addr, group_id)
         
         if key not in self.groups:
-            # 【修复】增加 FEC 组缓存硬上限防御，避免极端高负载下内存 OOM
             if len(self.groups) > 2048:
                 self.sweep_stale_groups()
-                if len(self.groups) > 2048:
-                    return [datagram] 
-            self.groups[key] = {'shards': {}, 'raw_lens': {}, 'n': n, 'm': m, 'time': time.time(), 'use_zfec': use_zfec}
+                if len(self.groups) > 2048: return [datagram] 
+            self.groups[key] = {'shards': {}, 'n': n, 'm': m, 'time': time.time(), 'use_zfec': use_zfec}
             
         grp = self.groups[key]
-        grp['shards'][idx] = payload; grp['raw_lens'][idx] = raw_len
+        grp['shards'][idx] = payload
         
         recovered = []
-        if idx < n: recovered.append(payload[:raw_len])
+        if idx < n:
+            if len(payload) >= 2:
+                true_len = struct.unpack("!H", payload[:2])[0]
+                if true_len <= len(payload) - 2:
+                    recovered.append(payload[2:2+true_len])
         
         rcv_data_idx = {i for i in grp['shards'].keys() if i < n}
         if len(rcv_data_idx) < n and len(grp['shards']) >= n:
             max_len = max(len(s) for s in grp['shards'].values())
             
-            # 【修复】按标志位严格匹配解码算法，防止 zfec 数据误入 XOR 导致数据损坏
             if grp.get('use_zfec', False):
                 if zfec:
                     src_shards, src_indices = [], []
                     for s_idx, s_bytes in sorted(grp['shards'].items())[:n]:
-                        src_shards.append(s_bytes.ljust(max_len, b'\x00')); src_indices.append(s_idx)
+                        src_shards.append(s_bytes.ljust(max_len, b'\x00'))
+                        src_indices.append(s_idx)
                     try:
                         decoded = zfec.Decoder(n, n + m).decode(src_shards, src_indices)
-                        for d_idx, d_data in enumerate(decoded):
-                            if d_idx not in rcv_data_idx:
-                                olen = grp['raw_lens'].get(d_idx, max_len)
-                                if olen > 0: recovered.append(d_data[:olen])
+                        for d_data in decoded:
+                            if len(d_data) >= 2:
+                                true_len = struct.unpack("!H", d_data[:2])[0]
+                                if true_len <= len(d_data) - 2:
+                                    recovered.append(d_data[2:2+true_len])
                     except Exception as e: logging.debug(f"[FEC] zfec error: {e}")
                 else:
                     if not self._zfec_warned:
@@ -263,12 +262,15 @@ class FECGroupDecoder:
                     try:
                         p_idx = next(i for i in grp['shards'].keys() if i >= n)
                         p_data = grp['shards'][p_idx].ljust(max_len, b'\x00')
-                        missing_idx = (set(range(n)) - rcv_data_idx).pop()
                         res = int.from_bytes(p_data, 'little')
-                        for i in rcv_data_idx: res ^= int.from_bytes(grp['shards'][i].ljust(max_len, b'\x00'), 'little')
+                        for i in rcv_data_idx: 
+                            res ^= int.from_bytes(grp['shards'][i].ljust(max_len, b'\x00'), 'little')
                         recovered_block = res.to_bytes(max_len, 'little')
-                        olen = grp['raw_lens'].get(missing_idx, max_len)
-                        if olen > 0: recovered.append(recovered_block[:olen])
+                        
+                        if len(recovered_block) >= 2:
+                            true_len = struct.unpack("!H", recovered_block[:2])[0]
+                            if true_len <= len(recovered_block) - 2:
+                                recovered.append(recovered_block[2:2+true_len])
                     except Exception as e: logging.debug(f"[FEC] XOR error: {e}")
 
             self.groups.pop(key, None)
@@ -340,9 +342,6 @@ class StreamAssembler:
                     self.is_broken = True; self.close(); return
 
         self.flush()
-        
-        if self.unacked_count >= 16 or (now - self.last_ack_time > 0.05 and self.unacked_count > 0):
-            pass # Offloaded to sweep
 
     def flush(self):
         if not self.writer or self.connecting or self.is_broken: return
@@ -365,8 +364,6 @@ class StreamAssembler:
 
     def close(self):
         self.is_broken = True
-        self.buffer.clear(); self.last_nack_time.clear()
-        # 【修复】显式重置字典，加速 pymalloc 内存池释放
         self.buffer = {}; self.last_nack_time = {}
         if self.writer:
             try: self.writer.close()
@@ -400,12 +397,11 @@ class MultiplexFrame:
 class LightconeEngineBase:
     def _setup_direct_socket(self, bind_host: str, bind_port: int) -> socket.socket:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.mem.udp_buf_size)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.mem.udp_buf_size)
         except Exception as e: 
-            logging.warning(f"[System] Could not scale UDP buffer to {self.mem.udp_buf_size//1024}KB: {e}. Check net.core.rmem_max")
+            logging.warning(f"[System] Could not scale UDP buffer to {self.mem.udp_buf_size//1024}KB: {e}. Check OS limits.")
         sock.setblocking(False)
         sock.bind((bind_host, bind_port))
         return sock
@@ -435,7 +431,20 @@ class LightconeEngineBase:
             await asyncio.sleep(0.1)
             now = time.time()
             
-            # 【抗 OOM】连接数逼近极限时，触发水位驱逐预警
+            if getattr(self, "fec_enabled", False):
+                if hasattr(self, "fec_encoder") and self.fec_encoder:
+                    if self.fec_encoder.buffer and (now - self.fec_encoder.last_act > self.mem.fec_flush_interval):
+                        if getattr(self, "s_ip", None):
+                            for p in self.fec_encoder._flush():
+                                try: self.sock.sendto(p, (self.s_ip, self.s_port))
+                                except: pass
+                elif hasattr(self, "fec_encs"):
+                    for addr, enc in list(self.fec_encs.items()):
+                        if enc.buffer and (now - enc.last_act > self.mem.fec_flush_interval):
+                            for p in enc._flush():
+                                try: self.sock.sendto(p, addr)
+                                except: pass
+            
             if len(stream_dict) > self.mem.max_streams * 0.9:
                 logging.warning(f"[Memory Defense] High stream count ({len(stream_dict)}). Evicting idle connections.")
                 sorted_streams = sorted(stream_dict.items(), key=lambda x: x[1].last_act)
@@ -480,8 +489,8 @@ class ClientEngine(LightconeEngineBase):
     def __init__(self, config: dict):
         self.config = config
         
-        mem_mb = config.get("available_memory_mb", 512)
-        latency_ms = config.get("expected_latency_ms", 100)
+        mem_mb = int(config.get("available_memory_mb", 512))
+        latency_ms = int(config.get("expected_latency_ms", 100))
         self.mem = MemoryProfile(mem_mb, latency_ms)
         self.mem.apply_user_config(config.get("max_concurrent_streams"))
         self.mem.print_profile()
@@ -490,7 +499,8 @@ class ClientEngine(LightconeEngineBase):
         self.s_host, self.s_port = config["server_addr"].split(":"); self.s_port = int(self.s_port)
         self.s_ip = None
         
-        self.fec_n = config.get("fec_data_shards", 0); self.fec_m = config.get("fec_parity_shards", 0)
+        self.fec_n = int(config.get("fec_data_shards", 0))
+        self.fec_m = int(config.get("fec_parity_shards", 0))
         self.fec_enabled = self.fec_n > 0 and self.fec_m > 0
         self.fec_encoder = FECGroupEncoder(self.fec_n, self.fec_m, self.mem) if self.fec_enabled else None
         self.fec_encs = {}
@@ -503,8 +513,12 @@ class ClientEngine(LightconeEngineBase):
     async def resolve_ddns_once(self):
         try:
             info = await asyncio.to_thread(socket.getaddrinfo, self.s_host, self.s_port)
-            if info and info[0][4][0] != self.s_ip:
-                self.s_ip = info[0][4][0]; logging.info(f"[DDNS] Target IP updated: {self.s_ip}")
+            if info:
+                # [Fix] Keep connection stable if current IP is still valid in multi-IP/DNS-RR setups
+                valid_ips = [item[4][0] for item in info]
+                if self.s_ip not in valid_ips:
+                    self.s_ip = valid_ips[0]
+                    logging.info(f"[DDNS] Target IP updated: {self.s_ip}")
         except Exception: pass
 
     async def resolve_ddns_loop(self):
@@ -634,8 +648,6 @@ class ClientEngine(LightconeEngineBase):
 
                             if ctx.assembler.is_broken or sid not in self.streams: break
                             ctx.cache[seq] = chunk
-                            
-                            # 严格守护缓存上限
                             if len(ctx.cache) > self.mem.max_window_packets: del ctx.cache[next(iter(ctx.cache))]
                             
                             self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, chunk), (self.s_ip, self.s_port))
@@ -760,12 +772,16 @@ class ClientEngine(LightconeEngineBase):
         asyncio.create_task(self.active_arq_sweep(self.streams))
         asyncio.create_task(self.heartbeat())
 
-        s_port = self.config.get("socks_port", 1080); h_port = self.config.get("http_port", 8080)
+        s_port = int(self.config.get("socks_port", 1080))
+        h_port = int(self.config.get("http_port", 8080))
         ss = await asyncio.start_server(self.handle_socks5, "0.0.0.0", s_port)
         hs = await asyncio.start_server(self.handle_http_proxy, "0.0.0.0", h_port)
         
-        logging.info(f"[Client] SOCKS5: {s_port} | HTTP: {h_port} | 🌿 Memory Defense Engine Active")
-        await asyncio.gather(ss.serve_forever(), hs.serve_forever())
+        logging.info(f"[Client] SOCKS5: {s_port} | HTTP: {h_port} | 🌿 Engine & Async FEC Active")
+        try:
+            await asyncio.gather(ss.serve_forever(), hs.serve_forever())
+        finally:
+            if self.sock: self.sock.close()
 
 
 # ============================================================================
@@ -774,14 +790,15 @@ class ClientEngine(LightconeEngineBase):
 class ServerEngine(LightconeEngineBase):
     def __init__(self, config: dict):
         self.config = config
-        mem_mb = config.get("available_memory_mb", 512)
-        latency_ms = config.get("expected_latency_ms", 100)
+        mem_mb = int(config.get("available_memory_mb", 512))
+        latency_ms = int(config.get("expected_latency_ms", 100))
         self.mem = MemoryProfile(mem_mb, latency_ms)
         self.mem.apply_user_config(config.get("max_concurrent_streams"))
         self.mem.print_profile()
         
         self.sec = TunnelSecurity(config["psk"], self.mem)
-        self.fec_n = config.get("fec_data_shards", 0); self.fec_m = config.get("fec_parity_shards", 0)
+        self.fec_n = int(config.get("fec_data_shards", 0))
+        self.fec_m = int(config.get("fec_parity_shards", 0))
         self.fec_enabled = self.fec_n > 0 and self.fec_m > 0
         self.fec_encs = {}; self.fec_decoder = FECGroupDecoder(self.mem.fec_timeout)
         
@@ -949,8 +966,11 @@ class ServerEngine(LightconeEngineBase):
         asyncio.create_task(self.sweep())
         asyncio.create_task(self.active_arq_sweep(self.tcp_conns))
 
-        logging.info(f"[Server] Online at {h}:{p} | 🌿 Memory Defense Engine Active")
-        await asyncio.Event().wait()
+        logging.info(f"[Server] Online at {h}:{p} | 🌿 Engine & Async FEC Active")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if self.sock: self.sock.close()
 
 
 def apply_resource_limits(limit_mb: int):
@@ -960,35 +980,57 @@ def apply_resource_limits(limit_mb: int):
             target = 65535 if hard == resource.RLIM_INFINITY else hard
             resource.setrlimit(resource.RLIMIT_NOFILE, (max(target, soft), target))
             
-            # 【修复】移除 1.2 的乘积冗余，使其严格与外部配置对齐，适配 Docker/K8s 的 Cgroup 容器限制。
             if limit_mb > 0:
                 limit_bytes = int(limit_mb * 1024 * 1024)
                 soft_mem, hard_mem = resource.getrlimit(resource.RLIMIT_AS)
                 if hard_mem == resource.RLIM_INFINITY or limit_bytes < hard_mem:
                     resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard_mem))
-                    logging.info(f"[System] Virtual memory limit (RLIMIT_AS) strictly set to {limit_mb} MB")
         except Exception as e:
             logging.debug(f"[System] Could not apply resource limits: {e}")
+
+
+def reset_logging(config: dict):
+    root_logger = logging.getLogger()
+    for h in root_logger.handlers[:]:
+        root_logger.removeHandler(h)
+        h.close()
+    logging.basicConfig(level=getattr(logging, config.get("log_level", "info").upper(), logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("config")
     args = parser.parse_args()
-    if not os.path.exists(args.config): sys.exit(1)
+    
+    cfg_path = os.path.abspath(args.config)
+    if not os.path.exists(cfg_path): sys.exit(1)
         
-    with open(args.config, "r", encoding="utf-8") as f: config = yaml.safe_load(f)
-    logging.basicConfig(level=getattr(logging, config.get("log_level", "info").upper(), logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
+    with open(cfg_path, "r", encoding="utf-8") as f: config = yaml.safe_load(f)
+    
+    reset_logging(config)
+    logging.info(f"[System] --------------------------------------------------")
+    logging.info(f"[System] Loaded strict configuration from: {cfg_path}")
     
     try: 
         import uvloop; asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
         logging.info("[System] uvloop active")
     except ImportError: pass
     
-    apply_resource_limits(config.get("available_memory_mb", 512))
+    apply_resource_limits(int(config.get("available_memory_mb", 512)))
     loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
     
     role = config.get("role", "client").lower()
-    try: loop.run_until_complete(ClientEngine(config).start() if role == "client" else ServerEngine(config).start())
-    except KeyboardInterrupt: pass
+    engine = ClientEngine(config) if role == "client" else ServerEngine(config)
+    
+    try: 
+        loop.run_until_complete(engine.start())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("[System] Received stop signal, shutting down elegantly...")
+    finally:
+        pending = asyncio.all_tasks(loop)
+        for task in pending: task.cancel()
+        if pending: loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
 
 if __name__ == "__main__": main()
