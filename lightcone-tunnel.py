@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Lightcone Tunnel - High-Performance Anti-DPI UDP Tunnel & Proxy Solution
-Production Release v2.0.5 (Extreme Throughput Chunking + Anti-Collapse ARQ)
+Production Release v4.2.2 (Memory-Aware Adaptive Engine & Strict Defenses)
 """
 
 import argparse
 import asyncio
+import gc
 import hashlib
 import logging
 import os
@@ -28,7 +29,60 @@ except ImportError:
 
 
 # ============================================================================
-# Constants & Protocol Configuration
+# Memory Profile & Dynamic Tuning Engine
+# ============================================================================
+class MemoryProfile:
+    """智能内存动态调节引擎：根据配置的物理内存和延迟，自适应推导最佳网络参数"""
+    def __init__(self, mem_mb: int, latency_ms: int = 100):
+        self.mem_mb = max(mem_mb, 512)
+        self.latency_ms = max(latency_ms, 10)  # 防止除 0
+        multiplier = self.mem_mb / 512.0
+        
+        # 基础容量推导
+        self.max_streams = min(int(512 * multiplier), 16384)
+        self.max_window_packets = min(int(2048 * multiplier), 16384)
+        self.idle_timeout = 120.0 if self.mem_mb <= 512 else min(120.0 * multiplier, 300.0)
+        
+        # 底层缓冲区推导
+        self.udp_buf_size = min(int(8388608 * multiplier), 33554432)
+        self.tcp_buf_limit = min(int(1048576 * multiplier), 8388608)
+        
+        # 乱序深水区和防重放字典
+        self.assembler_buf_len = min(int(2048 * multiplier), 16384)
+        self.seen_seq_limit = min(int(4000 * multiplier), 32000)
+
+        # 根据延迟动态推导时间/超时参数，取代硬编码
+        self.assembler_timeout = max(15.0, min(60.0, self.latency_ms / 100.0 * 15.0))
+        self.fec_timeout = max(0.5, min(5.0, self.latency_ms / 1000.0 * 10.0))
+        self.fec_flush_interval = max(0.010, min(0.050, self.latency_ms / 5000.0))
+        self.nack_cooldown = max(0.05, min(0.5, self.latency_ms / 1000.0 * 1.5))
+        self.nack_cooldown_slow = self.nack_cooldown * 2.0
+
+    def apply_user_config(self, user_streams: Optional[int]):
+        # 【修复】严格区分 None 和 0，防止 max_concurrent_streams: 0 穿透
+        if user_streams is None:
+            return
+        if user_streams <= 0:
+            logging.warning("[Memory] max_concurrent_streams is 0. Engine will reject all new connections.")
+            self.max_streams = 0
+            return
+            
+        if user_streams > self.max_streams:
+            logging.warning(f"[Memory] User max_concurrent_streams ({user_streams}) exceeds memory-derived limit ({self.max_streams}). Downscaling buffers to prevent OOM.")
+            ratio = self.max_streams / user_streams
+            self.max_window_packets = max(256, int(self.max_window_packets * ratio))
+            self.assembler_buf_len = max(256, int(self.assembler_buf_len * ratio))
+            self.tcp_buf_limit = max(131072, int(self.tcp_buf_limit * ratio))
+        self.max_streams = user_streams
+
+    def print_profile(self):
+        logging.info(f"[Memory Tuner] Configured RAM: {self.mem_mb} MB | Expected Latency: {self.latency_ms} ms")
+        logging.info(f"[Memory Tuner] Max Streams: {self.max_streams} | Window Cap: {self.max_window_packets} Pkts")
+        logging.info(f"[Memory Tuner] TCP/UDP Buf: {self.tcp_buf_limit//1024}KB/{self.udp_buf_size//1024}KB | Timeout: {self.assembler_timeout:.1f}s")
+
+
+# ============================================================================
+# Protocol Configuration
 # ============================================================================
 CMD_TCP_DATA   = 0x01
 CMD_TCP_CLOSE  = 0x02
@@ -43,11 +97,8 @@ ATYP_IPV6   = 0x04
 
 MAX_PAYLOAD_SIZE = 1000        
 TIMESTAMP_TOLERANCE_SEC = 30.0 
-IDLE_TIMEOUT_SEC = 300.0       
 CONNECT_TIMEOUT_SEC = 10.0     
 HEARTBEAT_INTERVAL_SEC = 20.0  
-DEFAULT_MAX_CONCURRENT_STREAMS = 1024 
-WINDOW_SIZE = 4096             # 4MB 飞行窗口，解除限速封印，千兆狂飙核心！
 
 
 def get_chunk_size() -> int:
@@ -55,11 +106,18 @@ def get_chunk_size() -> int:
 
 
 class StreamCtx:
-    def __init__(self, assembler):
+    def __init__(self, assembler, mem: MemoryProfile, resend_data_cb=None):
         self.assembler = assembler
+        self.resend_data_cb = resend_data_cb
         self.last_act = time.time()
         self.cache = {}
         self.acked_seq = 0
+        self.mem = mem
+        
+        self.cwnd = 128.0         
+        self.ssthresh = float(mem.max_window_packets)
+        self.last_loss_time = 0
+        self.last_ack_advance_time = time.time()
         self.last_stall_probe = 0
 
 
@@ -67,17 +125,19 @@ class StreamCtx:
 # Crypto & Security
 # ============================================================================
 class TunnelSecurity:
-    def __init__(self, psk: str):
+    def __init__(self, psk: str, mem: MemoryProfile):
         key = hashlib.sha256(psk.encode('utf-8')).digest()
         self.cipher = ChaCha20Poly1305(key)
         self.seen_sequences = {}
         self.seq_counter = 0
+        self.mem = mem
 
     def pack_and_encrypt(self, payload: bytes) -> bytes:
         self.seq_counter = (self.seq_counter + 1) & 0xFFFFFFFFFFFFFFFF
         timestamp = int(time.time())
-        pad_len = os.urandom(1)[0] % 16
-        padding = os.urandom(pad_len)
+        pad_len = random.getrandbits(4)
+        padding = os.urandom(pad_len) 
+        
         meta_header = os.urandom(4) + struct.pack("!QQB", self.seq_counter, timestamp, pad_len)
         nonce = struct.pack("!IQ", timestamp & 0xFFFFFFFF, self.seq_counter)
         encrypted = self.cipher.encrypt(nonce, payload + padding, meta_header)
@@ -93,7 +153,7 @@ class TunnelSecurity:
         if seq in self.seen_sequences: return None
         self.seen_sequences[seq] = now
 
-        if len(self.seen_sequences) > 5000:
+        if len(self.seen_sequences) > self.mem.seen_seq_limit:
             threshold = now - TIMESTAMP_TOLERANCE_SEC
             expired = [s for s, t in self.seen_sequences.items() if t < threshold]
             for s in expired: del self.seen_sequences[s]
@@ -105,36 +165,30 @@ class TunnelSecurity:
 
 
 # ============================================================================
-# FEC Engine (With Fast-XOR CPU Optimization)
+# FEC Engine
 # ============================================================================
 def _fast_xor_bytes(shards: List[bytes], max_len: int) -> bytes:
-    """Python 层面极速 XOR 算法，解决 zfec 不存在时的 CPU 卡顿问题"""
     res = int.from_bytes(shards[0], 'little')
-    for s in shards[1:]:
-        res ^= int.from_bytes(s, 'little')
+    for s in shards[1:]: res ^= int.from_bytes(s, 'little')
     return res.to_bytes(max_len, 'little')
 
 class FECGroupEncoder:
-    def __init__(self, data_shards: int, parity_shards: int):
-        self.n = data_shards
-        self.m = parity_shards
-        self.group_id = 0
-        self.buffer = []
-        self.last_act = time.time()
+    def __init__(self, data_shards: int, parity_shards: int, mem: MemoryProfile):
+        self.n, self.m = data_shards, parity_shards
+        self.mem = mem
+        self.group_id = 0; self.buffer = []; self.last_act = time.time()
+        # 【修复】利用 m 的最高位 (0x80) 来标记当前是否启用了 zfec 编码
+        self.m_encoded = self.m | 0x80 if zfec else self.m
 
     def input_packet(self, ciphertext: bytes) -> List[bytes]:
         if self.n <= 0 or self.m <= 0: return [ciphertext]
         now = time.time()
         out = []
-        if self.buffer and (now - self.last_act > 0.020): 
-            out.extend(self._flush())
-        self.last_act = now
-        idx = len(self.buffer)
-        self.buffer.append(ciphertext)
+        if self.buffer and (now - self.last_act > self.mem.fec_flush_interval): out.extend(self._flush())
+        self.last_act = now; idx = len(self.buffer); self.buffer.append(ciphertext)
         
-        out.append(struct.pack("!QBBBH", self.group_id, idx, self.n, self.m, len(ciphertext)) + ciphertext)
-        if len(self.buffer) == self.n: 
-            out.extend(self._flush())
+        out.append(struct.pack("!QBBBH", self.group_id, idx, self.n, self.m_encoded, len(ciphertext)) + ciphertext)
+        if len(self.buffer) == self.n: out.extend(self._flush())
         return out
 
     def _flush(self) -> List[bytes]:
@@ -144,34 +198,41 @@ class FECGroupEncoder:
         padded = [p.ljust(max_len, b'\x00') for p in self.buffer]
         while len(padded) < self.n: padded.append(b'\x00' * max_len)
 
-        if zfec:
-            encoder = zfec.Encoder(self.n, self.n + self.m)
-            parity_blocks = encoder.encode(padded)
-        else:
-            parity_blocks = [_fast_xor_bytes(padded, max_len)] * self.m
+        if zfec: parity_blocks = zfec.Encoder(self.n, self.n + self.m).encode(padded)
+        else: parity_blocks = [_fast_xor_bytes(padded, max_len)] * self.m
 
         for p_idx, p_data in enumerate(parity_blocks, start=self.n):
-            out.append(struct.pack("!QBBBH", self.group_id, p_idx, self.n, self.m, max_len) + p_data)
-        self.group_id = (self.group_id + 1) & 0xFFFFFFFFFFFFFFFF
-        self.buffer.clear()
+            out.append(struct.pack("!QBBBH", self.group_id, p_idx, self.n, self.m_encoded, max_len) + p_data)
+        self.group_id = (self.group_id + 1) & 0xFFFFFFFFFFFFFFFF; self.buffer.clear()
         return out
 
 class FECGroupDecoder:
-    def __init__(self, timeout_sec: float = 3.0):
+    def __init__(self, timeout_sec: float):
         self.groups = {}
         self.timeout_sec = timeout_sec
+        self._zfec_warned = False
 
     def process_datagram(self, peer_addr, datagram: bytes, fec_enabled: bool) -> List[bytes]:
         if not fec_enabled or len(datagram) < 13: return [datagram]
-        group_id, idx, n, m, raw_len = struct.unpack("!QBBBH", datagram[:13])
+        group_id, idx, n, m_raw, raw_len = struct.unpack("!QBBBH", datagram[:13])
+        
+        # 【修复】解开 m 的最高位，精准识别对方使用的编码方式
+        use_zfec = bool(m_raw & 0x80)
+        m = m_raw & 0x7F
+        
         payload = datagram[13:]
         key = (peer_addr, group_id)
         
         if key not in self.groups:
-            self.groups[key] = {'shards': {}, 'raw_lens': {}, 'n': n, 'm': m, 'time': time.time()}
+            # 【修复】增加 FEC 组缓存硬上限防御，避免极端高负载下内存 OOM
+            if len(self.groups) > 2048:
+                self.sweep_stale_groups()
+                if len(self.groups) > 2048:
+                    return [datagram] 
+            self.groups[key] = {'shards': {}, 'raw_lens': {}, 'n': n, 'm': m, 'time': time.time(), 'use_zfec': use_zfec}
+            
         grp = self.groups[key]
-        grp['shards'][idx] = payload
-        grp['raw_lens'][idx] = raw_len
+        grp['shards'][idx] = payload; grp['raw_lens'][idx] = raw_len
         
         recovered = []
         if idx < n: recovered.append(payload[:raw_len])
@@ -179,39 +240,58 @@ class FECGroupDecoder:
         rcv_data_idx = {i for i in grp['shards'].keys() if i < n}
         if len(rcv_data_idx) < n and len(grp['shards']) >= n:
             max_len = max(len(s) for s in grp['shards'].values())
-            src_shards = []
-            src_indices = []
-            for s_idx, s_bytes in sorted(grp['shards'].items())[:n]:
-                src_shards.append(s_bytes.ljust(max_len, b'\x00'))
-                src_indices.append(s_idx)
-            if zfec:
-                decoder = zfec.Decoder(n, n + m)
-                decoded = decoder.decode(src_shards, src_indices)
-                for d_idx, d_data in enumerate(decoded):
-                    if d_idx not in rcv_data_idx:
-                        olen = grp['raw_lens'].get(d_idx, max_len)
-                        if olen > 0: recovered.append(d_data[:olen])
+            
+            # 【修复】按标志位严格匹配解码算法，防止 zfec 数据误入 XOR 导致数据损坏
+            if grp.get('use_zfec', False):
+                if zfec:
+                    src_shards, src_indices = [], []
+                    for s_idx, s_bytes in sorted(grp['shards'].items())[:n]:
+                        src_shards.append(s_bytes.ljust(max_len, b'\x00')); src_indices.append(s_idx)
+                    try:
+                        decoded = zfec.Decoder(n, n + m).decode(src_shards, src_indices)
+                        for d_idx, d_data in enumerate(decoded):
+                            if d_idx not in rcv_data_idx:
+                                olen = grp['raw_lens'].get(d_idx, max_len)
+                                if olen > 0: recovered.append(d_data[:olen])
+                    except Exception as e: logging.debug(f"[FEC] zfec error: {e}")
+                else:
+                    if not self._zfec_warned:
+                        logging.warning("[FEC] Peer encoded with zfec, but zfec is missing locally. FEC recovery disabled.")
+                        self._zfec_warned = True
+            else:
+                if len(rcv_data_idx) == n - 1:
+                    try:
+                        p_idx = next(i for i in grp['shards'].keys() if i >= n)
+                        p_data = grp['shards'][p_idx].ljust(max_len, b'\x00')
+                        missing_idx = (set(range(n)) - rcv_data_idx).pop()
+                        res = int.from_bytes(p_data, 'little')
+                        for i in rcv_data_idx: res ^= int.from_bytes(grp['shards'][i].ljust(max_len, b'\x00'), 'little')
+                        recovered_block = res.to_bytes(max_len, 'little')
+                        olen = grp['raw_lens'].get(missing_idx, max_len)
+                        if olen > 0: recovered.append(recovered_block[:olen])
+                    except Exception as e: logging.debug(f"[FEC] XOR error: {e}")
+
             self.groups.pop(key, None)
-        elif len(rcv_data_idx) == n: 
-            self.groups.pop(key, None)
+        elif len(rcv_data_idx) == n: self.groups.pop(key, None)
         return recovered
 
     def sweep_stale_groups(self):
         now = time.time()
-        expired = [k for k, v in self.groups.items() if now - v['time'] > self.timeout_sec]
-        for k in expired: self.groups.pop(k, None)
+        for k in [k for k, v in self.groups.items() if now - v['time'] > self.timeout_sec]:
+            self.groups.pop(k, None)
 
 
 # ============================================================================
 # Stream Assembler & ARQ
 # ============================================================================
 class StreamAssembler:
-    def __init__(self, nack_callback, ack_callback, timeout_sec: float = 15.0):
+    def __init__(self, mem: MemoryProfile, nack_callback, ack_callback):
+        self.mem = mem
         self.writer = None
         self.expected_seq = 0
         self.buffer = {}
         self.connecting = True
-        self.timeout = timeout_sec
+        self.timeout = self.mem.assembler_timeout 
         self.is_broken = False
         
         self.nack_callback = nack_callback
@@ -222,6 +302,8 @@ class StreamAssembler:
 
     def set_writer(self, writer):
         self.writer = writer
+        if hasattr(self.writer.transport, 'set_write_buffer_limits'):
+            self.writer.transport.set_write_buffer_limits(high=self.mem.tcp_buf_limit)
         self.connecting = False
         self.flush()
 
@@ -236,42 +318,46 @@ class StreamAssembler:
             return
 
         if seq >= self.expected_seq:
-            # 【核心修复】：就算乱序超载，也绝对不能自杀关闭连接！直接丢包，等 ARQ 慢慢补
-            if len(self.buffer) < 8192:
+            if len(self.buffer) < self.mem.assembler_buf_len:
                 if seq not in self.buffer: 
                     self.buffer[seq] = (payload, now)
             else:
-                logging.debug(f"[Assembler] Deep buffer full. Packet {seq} dropped to prevent overflow.")
-                return
+                if seq == self.expected_seq:
+                    self.buffer[seq] = (payload, now)
+                else:
+                    return 
 
-        if seq > self.expected_seq:
-            scan_end = min(seq, self.expected_seq + 64)
-            for m_seq in range(self.expected_seq, scan_end):
-                if m_seq not in self.buffer:
-                    if now - self.last_nack_time.get(m_seq, 0) > 0.1:
-                        self.last_nack_time[m_seq] = now
-                        if self.nack_callback: self.nack_callback(m_seq)
+        if seq > self.expected_seq and self.expected_seq not in self.buffer:
+            if now - self.last_nack_time.get(self.expected_seq, 0) > self.mem.nack_cooldown:
+                self.last_nack_time[self.expected_seq] = now
+                if self.nack_callback: self.nack_callback(self.expected_seq)
 
         if self.buffer:
             min_seq = min(self.buffer.keys())
             if min_seq > self.expected_seq:
                 if now - self.buffer[min_seq][1] > self.timeout:
+                    logging.debug(f"[Assembler] TCP stream timeout at seq {self.expected_seq}. Closing.")
                     self.is_broken = True; self.close(); return
 
         self.flush()
         
         if self.unacked_count >= 16 or (now - self.last_ack_time > 0.05 and self.unacked_count > 0):
-            if self.ack_callback: self.ack_callback(self.expected_seq)
-            self.unacked_count = 0; self.last_ack_time = now
+            pass # Offloaded to sweep
 
     def flush(self):
         if not self.writer or self.connecting or self.is_broken: return
+        
+        if getattr(self.writer.transport, 'is_closing', lambda: False)():
+            self.is_broken = True; self.close(); return
+
         while self.expected_seq in self.buffer:
             payload, _ = self.buffer.pop(self.expected_seq)
             self.last_nack_time.pop(self.expected_seq, None)
             if payload:
                 try: 
                     self.writer.write(payload)
+                except (ConnectionResetError, BrokenPipeError):
+                    self.is_broken = True; self.close(); break
                 except Exception: 
                     self.is_broken = True; self.close(); break
             self.expected_seq += 1
@@ -280,6 +366,8 @@ class StreamAssembler:
     def close(self):
         self.is_broken = True
         self.buffer.clear(); self.last_nack_time.clear()
+        # 【修复】显式重置字典，加速 pymalloc 内存池释放
+        self.buffer = {}; self.last_nack_time = {}
         if self.writer:
             try: self.writer.close()
             except Exception: pass
@@ -299,68 +387,118 @@ class MultiplexFrame:
 
     @staticmethod
     def unpack(data: bytes) -> Tuple[int, int, int, int, str, int, bytes]:
-        stream_id, cmd, atyp, seq = struct.unpack("!IBBI", data[:10])
-        idx = 10; host = ""; port = 0
-        if atyp == ATYP_IPV4: 
-            host = socket.inet_ntoa(data[idx:idx+4])
-            port = struct.unpack("!H", data[idx+4:idx+6])[0]; idx += 6
-        elif atyp == ATYP_DOMAIN: 
-            d_len = data[idx]; idx += 1
-            host = data[idx:idx+d_len].decode('utf-8'); idx += d_len
-            port = struct.unpack("!H", data[idx:idx+2])[0]; idx += 2
-        elif atyp == ATYP_IPV6: 
-            host = socket.inet_ntop(socket.AF_INET6, data[idx:idx+16])
-            port = struct.unpack("!H", data[idx+16:idx+18])[0]; idx += 18
+        stream_id, cmd, atyp, seq = struct.unpack("!IBBI", data[:10]); idx = 10; host = ""; port = 0
+        if atyp == ATYP_IPV4: host = socket.inet_ntoa(data[idx:idx+4]); port = struct.unpack("!H", data[idx+4:idx+6])[0]; idx += 6
+        elif atyp == ATYP_DOMAIN: d_len = data[idx]; idx += 1; host = data[idx:idx+d_len].decode('utf-8'); idx += d_len; port = struct.unpack("!H", data[idx:idx+2])[0]; idx += 2
+        elif atyp == ATYP_IPV6: host = socket.inet_ntop(socket.AF_INET6, data[idx:idx+16]); port = struct.unpack("!H", data[idx+16:idx+18])[0]; idx += 18
         return stream_id, cmd, atyp, seq, host, port, data[idx:]
 
 
 # ============================================================================
-# Core Engine Base
+# Engine Base & Anti-OOM Controller
 # ============================================================================
 class LightconeEngineBase:
+    def _setup_direct_socket(self, bind_host: str, bind_port: int) -> socket.socket:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, self.mem.udp_buf_size)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, self.mem.udp_buf_size)
+        except Exception as e: 
+            logging.warning(f"[System] Could not scale UDP buffer to {self.mem.udp_buf_size//1024}KB: {e}. Check net.core.rmem_max")
+        sock.setblocking(False)
+        sock.bind((bind_host, bind_port))
+        return sock
+
+    def _direct_send(self, payload: bytes, addr: Tuple[str, int]):
+        enc = self.sec.pack_and_encrypt(payload)
+        
+        if getattr(self, "fec_enabled", False):
+            if hasattr(self, "fec_encoder") and self.fec_encoder:
+                pkts = self.fec_encoder.input_packet(enc)
+            else:
+                if addr not in self.fec_encs: self.fec_encs[addr] = FECGroupEncoder(self.fec_n, self.fec_m, self.mem)
+                pkts = self.fec_encs[addr].input_packet(enc)
+        else:
+            pkts = [enc]
+
+        for pkt in pkts:
+            try: self.sock.sendto(pkt, addr)
+            except BlockingIOError: pass 
+            except MemoryError:
+                logging.error("[Defense] MemoryError during UDP send! Dropping packet.")
+                import gc; gc.collect()
+            except Exception as e: logging.debug(f"[UDP Send] Exception: {e}")
+
     async def active_arq_sweep(self, stream_dict: dict):
         while True:
             await asyncio.sleep(0.1)
             now = time.time()
+            
+            # 【抗 OOM】连接数逼近极限时，触发水位驱逐预警
+            if len(stream_dict) > self.mem.max_streams * 0.9:
+                logging.warning(f"[Memory Defense] High stream count ({len(stream_dict)}). Evicting idle connections.")
+                sorted_streams = sorted(stream_dict.items(), key=lambda x: x[1].last_act)
+                to_drop = int(len(stream_dict) * 0.1)
+                for sid, ctx in sorted_streams[:to_drop]:
+                    ctx.assembler.close(); stream_dict.pop(sid, None)
+
             for sid, ctx in list(stream_dict.items()):
-                if now - ctx.last_act > IDLE_TIMEOUT_SEC:
-                    ctx.assembler.close()
-                    stream_dict.pop(sid, None)
-                    continue
+                if now - ctx.last_act > self.mem.idle_timeout:
+                    ctx.assembler.close(); stream_dict.pop(sid, None); continue
                 
                 asm = ctx.assembler
                 if asm.is_broken: continue
+
+                is_idle = (now - ctx.last_act > 1.0)
+                if is_idle and not asm.buffer and asm.unacked_count == 0:
+                    continue
                     
                 if asm.buffer:
-                    end_seq = min(max(asm.buffer.keys()) + 1, asm.expected_seq + 128)
-                    for m_seq in range(asm.expected_seq, end_seq):
-                        if m_seq not in asm.buffer:
-                            if now - asm.last_nack_time.get(m_seq, 0) > 0.1:
-                                asm.last_nack_time[m_seq] = now
-                                if asm.nack_callback: asm.nack_callback(m_seq)
+                    if min(asm.buffer.keys()) > asm.expected_seq:
+                        scan_window = max(32, int(self.mem.max_window_packets * 0.05))
+                        end_seq = min(max(asm.buffer.keys()) + 1, asm.expected_seq + scan_window)
+                        for m_seq in range(asm.expected_seq, end_seq):
+                            if m_seq not in asm.buffer:
+                                if now - asm.last_nack_time.get(m_seq, 0) > self.mem.nack_cooldown_slow:
+                                    asm.last_nack_time[m_seq] = now
+                                    if asm.nack_callback: asm.nack_callback(m_seq)
 
-                if asm.unacked_count > 0 and (now - asm.last_ack_time > 0.1):
-                    if asm.ack_callback: asm.ack_callback(asm.expected_seq)
-                    asm.unacked_count = 0; asm.last_ack_time = now
+                local_buf = asm.writer.transport.get_write_buffer_size() if asm.writer and hasattr(asm.writer, 'transport') else 0
+                if asm.unacked_count > 0 and (now - asm.last_ack_time > 0.05):
+                    if local_buf < self.mem.tcp_buf_limit: 
+                        if asm.ack_callback: asm.ack_callback(asm.expected_seq)
+                        asm.unacked_count = 0; asm.last_ack_time = now
+
+                if ctx.cache and (now - ctx.last_ack_advance_time > 0.5):
+                    ctx.last_ack_advance_time = now
+                    if ctx.acked_seq in ctx.cache and getattr(ctx, 'resend_data_cb', None):
+                        ctx.resend_data_cb(ctx.acked_seq, ctx.cache[ctx.acked_seq])
 
 
 class ClientEngine(LightconeEngineBase):
     def __init__(self, config: dict):
         self.config = config
-        self.max_streams = config.get("max_concurrent_streams", DEFAULT_MAX_CONCURRENT_STREAMS)
-        self.sec = TunnelSecurity(config["psk"])
-        self.s_host, self.s_port = config["server_addr"].split(":")
-        self.s_port = int(self.s_port)
+        
+        mem_mb = config.get("available_memory_mb", 512)
+        latency_ms = config.get("expected_latency_ms", 100)
+        self.mem = MemoryProfile(mem_mb, latency_ms)
+        self.mem.apply_user_config(config.get("max_concurrent_streams"))
+        self.mem.print_profile()
+        
+        self.sec = TunnelSecurity(config["psk"], self.mem)
+        self.s_host, self.s_port = config["server_addr"].split(":"); self.s_port = int(self.s_port)
         self.s_ip = None
         
         self.fec_n = config.get("fec_data_shards", 0); self.fec_m = config.get("fec_parity_shards", 0)
         self.fec_enabled = self.fec_n > 0 and self.fec_m > 0
-        self.fec_encoder = FECGroupEncoder(self.fec_n, self.fec_m) if self.fec_enabled else None
-        self.fec_decoder = FECGroupDecoder()
+        self.fec_encoder = FECGroupEncoder(self.fec_n, self.fec_m, self.mem) if self.fec_enabled else None
+        self.fec_encs = {}
+        self.fec_decoder = FECGroupDecoder(self.mem.fec_timeout)
 
         self.streams: Dict[int, StreamCtx] = {}
         self.udp_sessions: Dict[int, Tuple[Tuple[str, int], asyncio.DatagramTransport, float]] = {}
-        self.next_id = 1; self.transport = None
+        self.next_id = 1; self.sock = None
 
     async def resolve_ddns_once(self):
         try:
@@ -376,26 +514,85 @@ class ClientEngine(LightconeEngineBase):
     async def heartbeat(self):
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
-            if self.s_ip and self.transport:
-                try: self.send_to_server(MultiplexFrame.pack(0, CMD_HEARTBEAT, ATYP_IPV4, 0, "0.0.0.0", 0, b""))
-                except Exception: pass
+            if self.s_ip and self.sock:
+                self._direct_send(MultiplexFrame.pack(0, CMD_HEARTBEAT, ATYP_IPV4, 0, "0.0.0.0", 0, b""), (self.s_ip, self.s_port))
 
     async def sweep(self):
         while True:
             await asyncio.sleep(10)
             now = time.time()
-            for sid in [s for s, (_, _, act) in list(self.udp_sessions.items()) if now - act > IDLE_TIMEOUT_SEC]:
+            for sid in [s for s, (_, _, act) in list(self.udp_sessions.items()) if now - act > self.mem.idle_timeout]:
                 item = self.udp_sessions.pop(sid, None)
                 if item: item[1].close()
             if self.fec_enabled: self.fec_decoder.sweep_stale_groups()
+
+    def _read_from_os(self):
+        try:
+            for _ in range(5000): 
+                try:
+                    data, addr = self.sock.recvfrom(65536)
+                    for dpkt in self.fec_decoder.process_datagram(addr, data, self.fec_enabled):
+                        dec = self.sec.decrypt_and_unpack(dpkt)
+                        if not dec: continue
+                        try: sid, cmd, at, seq, rh, rp, pay = MultiplexFrame.unpack(dec)
+                        except Exception: continue
+                        
+                        if cmd == CMD_TCP_DATA and sid in self.streams:
+                            ctx = self.streams[sid]; ctx.last_act = time.time()
+                            ctx.assembler.receive(seq, pay)
+                            
+                        elif cmd == CMD_TCP_ACK and sid in self.streams:
+                            ctx = self.streams[sid]
+                            if seq > ctx.acked_seq:
+                                acked_count = seq - ctx.acked_seq
+                                ctx.acked_seq = seq
+                                ctx.last_ack_advance_time = time.time()
+                                
+                                if ctx.cwnd < ctx.ssthresh: ctx.cwnd += acked_count
+                                else: ctx.cwnd += max(acked_count * 0.5, 1.0)
+                                ctx.cwnd = min(ctx.cwnd, float(self.mem.max_window_packets))
+                                
+                                keys_to_del = [k for k in ctx.cache.keys() if k < seq]
+                                for k in keys_to_del: del ctx.cache[k]
+                                
+                        elif cmd == CMD_TCP_RESEND and sid in self.streams:
+                            ctx = self.streams[sid]; ctx.last_act = time.time()
+                            
+                            now = time.time()
+                            if now - ctx.last_loss_time > 0.5:
+                                ctx.ssthresh = max(int(ctx.cwnd * 0.9), 128)
+                                ctx.cwnd = ctx.ssthresh
+                                ctx.last_loss_time = now
+
+                            if seq in ctx.cache:
+                                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, rh, rp, ctx.cache[seq]), (self.s_ip, self.s_port))
+                                
+                        elif cmd == CMD_UDP_DATA and sid in self.udp_sessions:
+                            ca, ut, _ = self.udp_sessions[sid]; self.udp_sessions[sid] = (ca, ut, time.time())
+                            if at == ATYP_IPV4: ab = socket.inet_aton(rh)
+                            elif at == ATYP_DOMAIN: hb = rh.encode('utf-8'); ab = struct.pack("!B", len(hb)) + hb
+                            elif at == ATYP_IPV6: ab = socket.inet_pton(socket.AF_INET6, rh)
+                            else: continue
+                            ut.sendto(struct.pack("!HBB", 0, 0, at) + ab + struct.pack("!H", rp) + pay, ca)
+                            
+                        elif cmd == CMD_HEARTBEAT: pass
+                        
+                        elif cmd == CMD_TCP_CLOSE:
+                            ctx = self.streams.pop(sid, None)
+                            if ctx: ctx.assembler.close()
+                except BlockingIOError: break 
+                except ConnectionResetError: pass 
+                except Exception: pass
+        except MemoryError:
+            logging.error("[Defense] MemoryError during UDP receive burst! Forcing garbage collection.")
+            gc.collect()
 
     async def handle_socks5(self, reader, writer):
         sid = None; atyp = ATYP_IPV4; host = ""; port = 0; u_trans = None
         try:
             ver, nmethods = struct.unpack("!BB", await reader.readexactly(2))
             await reader.readexactly(nmethods)
-            writer.write(b"\x05\x00")
-            await writer.drain()
+            writer.write(b"\x05\x00"); await writer.drain()
 
             ver, cmd, _, atyp = struct.unpack("!BBBB", await reader.readexactly(4))
             
@@ -406,46 +603,52 @@ class ClientEngine(LightconeEngineBase):
             elif atyp == ATYP_IPV6: host = socket.inet_ntop(socket.AF_INET6, await reader.readexactly(16))
             port = struct.unpack("!H", await reader.readexactly(2))[0]
 
-            if cmd == 0x01: # TCP CONNECT
-                if len(self.streams) >= self.max_streams: writer.close(); return
-                
-                writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
+            if cmd == 0x01:
+                if len(self.streams) >= self.mem.max_streams: writer.close(); return
+                writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00"); await writer.drain()
                 sid = self.next_id; self.next_id += 1
                 
-                def on_nack(m_seq): self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_RESEND, atyp, m_seq, host, port, b""))
-                def on_ack(ack_seq): self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_ACK, atyp, ack_seq, host, port, b""))
+                def on_nack(m_seq): self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_RESEND, atyp, m_seq, host, port, b""), (self.s_ip, self.s_port))
+                def on_ack(ack_seq): self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_ACK, atyp, ack_seq, host, port, b""), (self.s_ip, self.s_port))
+                def on_resend(m_seq, pay): self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, m_seq, host, port, pay), (self.s_ip, self.s_port))
                     
-                ctx = StreamCtx(StreamAssembler(on_nack, on_ack))
+                ctx = StreamCtx(StreamAssembler(self.mem, on_nack, on_ack), self.mem, resend_data_cb=on_resend)
                 ctx.assembler.set_writer(writer); self.streams[sid] = ctx
-                seq = 0
+                seq = 0; pkt_cnt = 0
 
                 while True:
-                    # 【核心突破 2】：巨型分块读取 (64KB)，消除 OS 频繁切换导致的速度天花板
-                    data = await reader.read(65536)
-                    if not data: break
-                    
-                    ctx.last_act = time.time()
-                    
-                    for i in range(0, len(data), MAX_PAYLOAD_SIZE):
-                        chunk = data[i:i+MAX_PAYLOAD_SIZE]
+                    try:
+                        data = await reader.read(65536)
+                        if not data: break
+                        ctx.last_act = time.time()
                         
-                        while seq - ctx.acked_seq > WINDOW_SIZE:
-                            if ctx.assembler.is_broken or sid not in self.streams: break
-                            await asyncio.sleep(0.01)
-                            if time.time() - ctx.last_stall_probe > 0.1:
-                                ctx.last_stall_probe = time.time()
-                                if ctx.acked_seq in ctx.cache:
-                                    self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, ctx.acked_seq, host, port, ctx.cache[ctx.acked_seq]))
+                        for i in range(0, len(data), MAX_PAYLOAD_SIZE):
+                            chunk = data[i:i+MAX_PAYLOAD_SIZE]
+                            while seq - ctx.acked_seq > int(ctx.cwnd):
+                                if ctx.assembler.is_broken or sid not in self.streams: break
+                                await asyncio.sleep(0.01)
+                                if time.time() - ctx.last_stall_probe > 0.2:
+                                    ctx.last_stall_probe = time.time()
+                                    if ctx.acked_seq in ctx.cache:
+                                        self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, ctx.acked_seq, host, port, ctx.cache[ctx.acked_seq]), (self.s_ip, self.s_port))
 
-                        if ctx.assembler.is_broken or sid not in self.streams: break
-                        
-                        ctx.cache[seq] = chunk
-                        self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, chunk))
-                        seq += 1
+                            if ctx.assembler.is_broken or sid not in self.streams: break
+                            ctx.cache[seq] = chunk
+                            
+                            # 严格守护缓存上限
+                            if len(ctx.cache) > self.mem.max_window_packets: del ctx.cache[next(iter(ctx.cache))]
+                            
+                            self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, chunk), (self.s_ip, self.s_port))
+                            seq += 1
+                            pkt_cnt += 1
+                            if pkt_cnt % 64 == 0: await asyncio.sleep(0) 
+                    except MemoryError:
+                        logging.error("[Defense] MemoryError during Client TCP Read! Dropping chunk.")
+                        gc.collect()
+                        await asyncio.sleep(0.1)
 
             elif cmd == 0x03:
-                if len(self.udp_sessions) >= self.max_streams: writer.close(); return
+                if len(self.udp_sessions) >= self.mem.max_streams: writer.close(); return
                 sid = self.next_id; self.next_id += 1
                 
                 class URelay(asyncio.DatagramProtocol):
@@ -459,17 +662,15 @@ class ClientEngine(LightconeEngineBase):
                         elif u_at == ATYP_IPV6: dh = socket.inet_ntop(socket.AF_INET6, dt[idx:idx+16]); dp = struct.unpack("!H", dt[idx+16:idx+18])[0]; idx += 18
                         else: return
                         self.eng.udp_sessions[self.sid] = (addr, self.trans, time.time())
-                        self.eng.send_to_server(MultiplexFrame.pack(self.sid, CMD_UDP_DATA, u_at, 0, dh, dp, dt[idx:]))
+                        self.eng._direct_send(MultiplexFrame.pack(self.sid, CMD_UDP_DATA, u_at, 0, dh, dp, dt[idx:]), (self.eng.s_ip, self.eng.s_port))
                 
                 loop = asyncio.get_running_loop()
                 u_trans, _ = await loop.create_datagram_endpoint(lambda: URelay(self, sid), local_addr=("0.0.0.0", 0))
-                _, relay_port = u_trans.get_extra_info("sockname")
-                
-                reply = struct.pack("!BBBB4sH", 0x05, 0x00, 0x00, 0x01, socket.inet_aton("127.0.0.1"), relay_port)
-                writer.write(reply)
+                writer.write(struct.pack("!BBBB4sH", 0x05, 0x00, 0x00, 0x01, socket.inet_aton("127.0.0.1"), u_trans.get_extra_info("sockname")[1]))
                 await writer.drain()
                 while await reader.read(1024): pass
                     
+        except (ConnectionError, asyncio.IncompleteReadError): pass 
         except Exception: pass
         finally:
             writer.close()
@@ -479,7 +680,7 @@ class ClientEngine(LightconeEngineBase):
                 ctx = self.streams.pop(sid, None)
                 if ctx:
                     ctx.assembler.close()
-                    try: self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_CLOSE, atyp, 0, host, port, b""))
+                    try: self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_CLOSE, atyp, 0, host, port, b""), (self.s_ip, self.s_port))
                     except Exception: pass
 
     async def handle_http_proxy(self, reader, writer):
@@ -488,7 +689,7 @@ class ClientEngine(LightconeEngineBase):
             line = await reader.readline()
             if not line: return
             parts = line.decode('utf-8', errors='ignore').split()
-            if len(parts) < 2 or len(self.streams) >= self.max_streams: writer.close(); return
+            if len(parts) < 2 or len(self.streams) >= self.mem.max_streams: writer.close(); return
                 
             method, url = parts[0], parts[1]
             sid = self.next_id; self.next_id += 1
@@ -498,123 +699,72 @@ class ClientEngine(LightconeEngineBase):
                 port = int(port_str) if port_str.isdigit() else 443
                 while True:
                     if (await reader.readline()) in (b"\r\n", b"\n", b""): break
-                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                await writer.drain()
+                writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n"); await writer.drain()
                 seq = 0
             else:
                 parsed = urlparse(url)
                 host, port = parsed.hostname or "", parsed.port or 80
                 seq = 0
-                self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, line))
+                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, line), (self.s_ip, self.s_port))
                 seq += 1
 
-            ctx = StreamCtx(StreamAssembler(
-                lambda ms: self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_RESEND, atyp, ms, host, port, b"")),
-                lambda ak: self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_ACK, atyp, ak, host, port, b""))
-            ))
+            def on_nack(ms): self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_RESEND, atyp, ms, host, port, b""), (self.s_ip, self.s_port))
+            def on_ack(ak): self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_ACK, atyp, ak, host, port, b""), (self.s_ip, self.s_port))
+            def on_resend(ms, pay): self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, ms, host, port, pay), (self.s_ip, self.s_port))
+
+            ctx = StreamCtx(StreamAssembler(self.mem, on_nack, on_ack), self.mem, resend_data_cb=on_resend)
             ctx.assembler.set_writer(writer); self.streams[sid] = ctx
             if method != "CONNECT": ctx.cache[0] = line
             
             while True:
                 data = await reader.read(65536)
                 if not data: break
-                
                 ctx.last_act = time.time()
                 
                 for i in range(0, len(data), MAX_PAYLOAD_SIZE):
                     chunk = data[i:i+MAX_PAYLOAD_SIZE]
-                    
-                    while seq - ctx.acked_seq > WINDOW_SIZE:
+                    while seq - ctx.acked_seq > int(ctx.cwnd):
                         if ctx.assembler.is_broken or sid not in self.streams: break
                         await asyncio.sleep(0.01)
-                        if time.time() - ctx.last_stall_probe > 0.1:
+                        if time.time() - ctx.last_stall_probe > 0.2:
                             ctx.last_stall_probe = time.time()
                             if ctx.acked_seq in ctx.cache:
-                                self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, ctx.acked_seq, host, port, ctx.cache[ctx.acked_seq]))
+                                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, ctx.acked_seq, host, port, ctx.cache[ctx.acked_seq]), (self.s_ip, self.s_port))
 
                     if ctx.assembler.is_broken or sid not in self.streams: break
-                    
                     ctx.cache[seq] = chunk
-                    self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, chunk))
+                    if len(ctx.cache) > self.mem.max_window_packets: del ctx.cache[next(iter(ctx.cache))]
+                    
+                    self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, chunk), (self.s_ip, self.s_port))
                     seq += 1
 
+        except (ConnectionError, asyncio.IncompleteReadError): pass
         except Exception: pass
         finally:
             writer.close()
             ctx = self.streams.pop(sid, None)
             if ctx:
                 ctx.assembler.close()
-                try: self.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_CLOSE, atyp, 0, host, port, b""))
+                try: self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_CLOSE, atyp, 0, host, port, b""), (self.s_ip, self.s_port))
                 except Exception: pass
-
-    def send_to_server(self, payload: bytes):
-        if self.s_ip and self.transport:
-            enc = self.sec.pack_and_encrypt(payload)
-            if self.fec_enabled and self.fec_encoder:
-                for pkt in self.fec_encoder.input_packet(enc): self.transport.sendto(pkt, (self.s_ip, self.s_port))
-            else: self.transport.sendto(enc, (self.s_ip, self.s_port))
 
     async def start(self):
         loop = asyncio.get_running_loop()
         await self.resolve_ddns_once()
         asyncio.create_task(self.resolve_ddns_loop())
+        
+        self.sock = self._setup_direct_socket("0.0.0.0", 0)
+        loop.add_reader(self.sock.fileno(), self._read_from_os)
+
         asyncio.create_task(self.sweep())
         asyncio.create_task(self.active_arq_sweep(self.streams))
         asyncio.create_task(self.heartbeat())
 
-        class CP(asyncio.DatagramProtocol):
-            def __init__(self, eng): self.eng = eng; self.tr = None
-            def connection_made(self, tr): self.tr = tr
-            def datagram_received(self, data, addr):
-                for dpkt in self.eng.fec_decoder.process_datagram(addr, data, self.eng.fec_enabled):
-                    dec = self.eng.sec.decrypt_and_unpack(dpkt)
-                    if not dec: continue
-                    try: sid, cmd, at, seq, rh, rp, pay = MultiplexFrame.unpack(dec)
-                    except Exception: continue
-                    
-                    if cmd == CMD_TCP_DATA and sid in self.eng.streams:
-                        ctx = self.eng.streams[sid]; ctx.last_act = time.time()
-                        ctx.assembler.receive(seq, pay)
-                        
-                    elif cmd == CMD_TCP_ACK and sid in self.eng.streams:
-                        ctx = self.eng.streams[sid]
-                        if seq > ctx.acked_seq:
-                            ctx.acked_seq = seq
-                            keys_to_del = [k for k in ctx.cache.keys() if k < seq]
-                            for k in keys_to_del: del ctx.cache[k]
-                            
-                    elif cmd == CMD_TCP_RESEND and sid in self.eng.streams:
-                        ctx = self.eng.streams[sid]; ctx.last_act = time.time()
-                        if seq in ctx.cache:
-                            self.eng.send_to_server(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, rh, rp, ctx.cache[seq]))
-                            
-                    elif cmd == CMD_UDP_DATA and sid in self.eng.udp_sessions:
-                        ca, ut, _ = self.eng.udp_sessions[sid]; self.eng.udp_sessions[sid] = (ca, ut, time.time())
-                        if at == ATYP_IPV4: ab = socket.inet_aton(rh)
-                        elif at == ATYP_DOMAIN: hb = rh.encode('utf-8'); ab = struct.pack("!B", len(hb)) + hb
-                        elif at == ATYP_IPV6: ab = socket.inet_pton(socket.AF_INET6, rh)
-                        else: return
-                        ut.sendto(struct.pack("!HBB", 0, 0, at) + ab + struct.pack("!H", rp) + pay, ca)
-                        
-                    elif cmd == CMD_TCP_CLOSE:
-                        ctx = self.eng.streams.pop(sid, None)
-                        if ctx: ctx.assembler.close()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try: 
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
-        except Exception: pass
-        sock.bind(("0.0.0.0", 0))
-
-        self.transport, _ = await loop.create_datagram_endpoint(lambda: CP(self), sock=sock)
-        s_port = self.config.get("socks_port", 1080)
-        h_port = self.config.get("http_port", 8080)
-        
+        s_port = self.config.get("socks_port", 1080); h_port = self.config.get("http_port", 8080)
         ss = await asyncio.start_server(self.handle_socks5, "0.0.0.0", s_port)
         hs = await asyncio.start_server(self.handle_http_proxy, "0.0.0.0", h_port)
         
-        logging.info(f"[Client] SOCKS5: {s_port} | HTTP: {h_port} | Ultra-Speed Engine Online")
+        logging.info(f"[Client] SOCKS5: {s_port} | HTTP: {h_port} | 🌿 Memory Defense Engine Active")
         await asyncio.gather(ss.serve_forever(), hs.serve_forever())
 
 
@@ -624,154 +774,182 @@ class ClientEngine(LightconeEngineBase):
 class ServerEngine(LightconeEngineBase):
     def __init__(self, config: dict):
         self.config = config
-        self.max_streams = config.get("max_concurrent_streams", DEFAULT_MAX_CONCURRENT_STREAMS)
-        self.sec = TunnelSecurity(config["psk"])
+        mem_mb = config.get("available_memory_mb", 512)
+        latency_ms = config.get("expected_latency_ms", 100)
+        self.mem = MemoryProfile(mem_mb, latency_ms)
+        self.mem.apply_user_config(config.get("max_concurrent_streams"))
+        self.mem.print_profile()
+        
+        self.sec = TunnelSecurity(config["psk"], self.mem)
         self.fec_n = config.get("fec_data_shards", 0); self.fec_m = config.get("fec_parity_shards", 0)
         self.fec_enabled = self.fec_n > 0 and self.fec_m > 0
-        self.fec_encs = {}; self.fec_decoder = FECGroupDecoder()
+        self.fec_encs = {}; self.fec_decoder = FECGroupDecoder(self.mem.fec_timeout)
         
         self.tcp_conns: Dict[int, StreamCtx] = {}
-        self.udp_nat: Dict[int, Tuple[asyncio.DatagramProtocol, float]] = {}
-
-    def send_to_client(self, transport, addr, payload: bytes):
-        enc = self.sec.pack_and_encrypt(payload)
-        if self.fec_enabled:
-            if addr not in self.fec_encs: self.fec_encs[addr] = FECGroupEncoder(self.fec_n, self.fec_m)
-            for pkt in self.fec_encs[addr].input_packet(enc): transport.sendto(pkt, addr)
-        else: transport.sendto(enc, addr)
+        self.udp_nat: Dict[int, object] = {}
+        self.sock = None
 
     async def sweep(self):
         while True:
             await asyncio.sleep(10)
             now = time.time()
-            for sid in [s for s, (_, act) in list(self.udp_nat.items()) if now - act > IDLE_TIMEOUT_SEC]:
-                item = self.udp_nat.pop(sid, None)
-                if item: item[0].close()
+            for sid in list(self.udp_nat.keys()):
+                val = self.udp_nat[sid]
+                if isinstance(val, tuple) and now - val[1] > self.mem.idle_timeout:
+                    item = self.udp_nat.pop(sid, None)
+                    if item and isinstance(item, tuple): item[0].close()
             if self.fec_enabled: self.fec_decoder.sweep_stale_groups()
 
-    async def _pipe(self, sid, at, h, p, tr, ca):
-        try: 
-            reader, writer = await asyncio.wait_for(asyncio.open_connection(h, p), timeout=CONNECT_TIMEOUT_SEC)
+    def _read_from_os(self):
+        try:
+            for _ in range(10000): 
+                try:
+                    data, addr = self.sock.recvfrom(65536)
+                    for dpkt in self.fec_decoder.process_datagram(addr, data, getattr(self, "fec_enabled", False)):
+                        dec = self.sec.decrypt_and_unpack(dpkt)
+                        if not dec: continue
+                        try: sid, cmd, at, seq, rh, rp, pay = MultiplexFrame.unpack(dec)
+                        except Exception: continue
+
+                        if cmd == CMD_TCP_DATA:
+                            if sid not in self.tcp_conns:
+                                if len(self.tcp_conns) >= self.mem.max_streams: continue
+                                
+                                def on_nack(ms, a=addr, i=sid, ta=at, th=rh, tp=rp): self._direct_send(MultiplexFrame.pack(i, CMD_TCP_RESEND, ta, ms, th, tp, b""), a)
+                                def on_ack(ak, a=addr, i=sid, ta=at, th=rh, tp=rp): self._direct_send(MultiplexFrame.pack(i, CMD_TCP_ACK, ta, ak, th, tp, b""), a)
+                                def on_resend(ms, pay, a=addr, i=sid, ta=at, th=rh, tp=rp): self._direct_send(MultiplexFrame.pack(i, CMD_TCP_DATA, ta, ms, th, tp, pay), a)
+                                
+                                ctx = StreamCtx(StreamAssembler(self.mem, on_nack, on_ack), self.mem, resend_data_cb=on_resend)
+                                self.tcp_conns[sid] = ctx
+                                asyncio.create_task(self._pipe(sid, at, rh, rp, addr))
+                            
+                            ctx = self.tcp_conns.get(sid)
+                            if ctx: 
+                                ctx.last_act = time.time(); ctx.assembler.receive(seq, pay)
+                        
+                        elif cmd == CMD_TCP_ACK and sid in self.tcp_conns:
+                            ctx = self.tcp_conns[sid]
+                            if seq > ctx.acked_seq:
+                                acked_count = seq - ctx.acked_seq
+                                ctx.acked_seq = seq
+                                ctx.last_ack_advance_time = time.time()
+                                
+                                if ctx.cwnd < ctx.ssthresh: ctx.cwnd += acked_count
+                                else: ctx.cwnd += max(acked_count * 0.5, 1.0)
+                                ctx.cwnd = min(ctx.cwnd, float(self.mem.max_window_packets))
+                                
+                                keys_to_del = [k for k in ctx.cache.keys() if k < seq]
+                                for k in keys_to_del: del ctx.cache[k]
+                            
+                        elif cmd == CMD_TCP_RESEND and sid in self.tcp_conns:
+                            ctx = self.tcp_conns[sid]; ctx.last_act = time.time()
+                            
+                            now = time.time()
+                            if now - ctx.last_loss_time > 0.5:
+                                ctx.ssthresh = max(int(ctx.cwnd * 0.9), 128)
+                                ctx.cwnd = ctx.ssthresh
+                                ctx.last_loss_time = now
+
+                            if seq in ctx.cache: 
+                                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, rh, rp, ctx.cache[seq]), addr)
+                                
+                        elif cmd == CMD_UDP_DATA:
+                            if sid not in self.udp_nat:
+                                self.udp_nat[sid] = "creating"
+                                async def create_udp(seng, s_id, t_ca, p_pay, p_rh, p_rp):
+                                    try:
+                                        loop = asyncio.get_running_loop()
+                                        class FullConeUDPProtocol(asyncio.DatagramProtocol):
+                                            def __init__(self, s, i, c): self.s = s; self.i = i; self.c = c
+                                            def connection_made(self, tr): self.tr = tr
+                                            def datagram_received(self, r_dt, r_addr):
+                                                r_ip, r_port = r_addr[0], r_addr[1]; r_at = ATYP_IPV6 if ":" in r_ip else ATYP_IPV4
+                                                self.s._direct_send(MultiplexFrame.pack(self.i, CMD_UDP_DATA, r_at, 0, r_ip, r_port, r_dt), self.c)
+                                                
+                                        u_tr, _ = await loop.create_datagram_endpoint(lambda: FullConeUDPProtocol(seng, s_id, t_ca), local_addr=("0.0.0.0", 0))
+                                        seng.udp_nat[s_id] = (u_tr, time.time())
+                                        u_tr.sendto(p_pay, (p_rh, p_rp))
+                                    except Exception: seng.udp_nat.pop(s_id, None)
+                                        
+                                asyncio.create_task(create_udp(self, sid, addr, pay, rh, rp))
+                            elif isinstance(self.udp_nat.get(sid), tuple):
+                                u_tr, _ = self.udp_nat[sid]; self.udp_nat[sid] = (u_tr, time.time())
+                                u_tr.sendto(pay, (rh, rp))
+
+                        elif cmd == CMD_HEARTBEAT:
+                            self._direct_send(MultiplexFrame.pack(0, CMD_HEARTBEAT, ATYP_IPV4, 0, "0.0.0.0", 0, b""), addr)
+
+                        elif cmd == CMD_TCP_CLOSE:
+                            ctx = self.tcp_conns.pop(sid, None)
+                            if ctx: ctx.assembler.close()
+                except BlockingIOError: break
+                except ConnectionResetError: pass
+                except Exception: pass
+        except MemoryError:
+            logging.error("[Defense] MemoryError during Server UDP burst! Initiating GC.")
+            gc.collect()
+
+    async def _pipe(self, sid, at, h, p, ca):
+        try: reader, writer = await asyncio.wait_for(asyncio.open_connection(h, p), timeout=CONNECT_TIMEOUT_SEC)
         except Exception:
             self.tcp_conns.pop(sid, None)
-            self.send_to_client(tr, ca, MultiplexFrame.pack(sid, CMD_TCP_CLOSE, at, 0, h, p, b""))
+            self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_CLOSE, at, 0, h, p, b""), ca)
             return
 
         ctx = self.tcp_conns.get(sid)
         if ctx: ctx.assembler.set_writer(writer)
         else: writer.close(); return
 
-        seq = 0
+        seq = 0; pkt_cnt = 0
         try:
             while True:
                 data = await reader.read(65536)
                 if not data: break
-                
                 ctx.last_act = time.time()
                 
                 for i in range(0, len(data), MAX_PAYLOAD_SIZE):
                     chunk = data[i:i+MAX_PAYLOAD_SIZE]
-                    
-                    while seq - ctx.acked_seq > WINDOW_SIZE:
+                    while seq - ctx.acked_seq > int(ctx.cwnd):
                         if ctx.assembler.is_broken or sid not in self.tcp_conns: break
                         await asyncio.sleep(0.01)
-                        if time.time() - ctx.last_stall_probe > 0.1:
+                        if time.time() - ctx.last_stall_probe > 0.2:
                             ctx.last_stall_probe = time.time()
                             if ctx.acked_seq in ctx.cache:
-                                self.send_to_client(tr, ca, MultiplexFrame.pack(sid, CMD_TCP_DATA, at, ctx.acked_seq, h, p, ctx.cache[ctx.acked_seq]))
+                                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, ctx.acked_seq, h, p, ctx.cache[ctx.acked_seq]), ca)
 
                     if ctx.assembler.is_broken or sid not in self.tcp_conns: break
-                        
                     ctx.cache[seq] = chunk
-                    self.send_to_client(tr, ca, MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, h, p, chunk))
+                    if len(ctx.cache) > self.mem.max_window_packets: del ctx.cache[next(iter(ctx.cache))]
+                    
+                    self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, h, p, chunk), ca)
                     seq += 1
-
+                    pkt_cnt += 1
+                    if pkt_cnt % 64 == 0: await asyncio.sleep(0)
+                    
+        except MemoryError:
+            logging.error("[Defense] MemoryError during Server TCP Read! Dropping chunk.")
+            gc.collect()
+            await asyncio.sleep(0.1)
+        except (ConnectionError, asyncio.IncompleteReadError): pass
         except Exception: pass
         finally:
             writer.close()
             ctx = self.tcp_conns.pop(sid, None)
             if ctx:
                 ctx.assembler.close()
-                self.send_to_client(tr, ca, MultiplexFrame.pack(sid, CMD_TCP_CLOSE, at, 0, h, p, b""))
+                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_CLOSE, at, 0, h, p, b""), ca)
 
     async def start(self):
         loop = asyncio.get_running_loop()
+        h, p = self.config["server_addr"].split(":"); p = int(p)
+        
+        self.sock = self._setup_direct_socket(h, p)
+        loop.add_reader(self.sock.fileno(), self._read_from_os)
+        
         asyncio.create_task(self.sweep())
         asyncio.create_task(self.active_arq_sweep(self.tcp_conns))
-        
-        h, p = self.config["server_addr"].split(":"); p = int(p)
 
-        class SP(asyncio.DatagramProtocol):
-            def __init__(self, eng): self.eng = eng; self.tr = None
-            def connection_made(self, tr): self.tr = tr
-            def datagram_received(self, data, addr):
-                for dpkt in self.eng.fec_decoder.process_datagram(addr, data, self.eng.fec_enabled):
-                    dec = self.eng.sec.decrypt_and_unpack(dpkt)
-                    if not dec: continue
-                    try: sid, cmd, at, seq, rh, rp, pay = MultiplexFrame.unpack(dec)
-                    except Exception: continue
-
-                    if cmd == CMD_TCP_DATA:
-                        if sid not in self.eng.tcp_conns:
-                            if len(self.eng.tcp_conns) >= self.eng.max_streams: return
-                            
-                            def on_nack(m_seq): self.eng.send_to_client(self.tr, addr, MultiplexFrame.pack(sid, CMD_TCP_RESEND, at, m_seq, rh, rp, b""))
-                            def on_ack(ack_seq): self.eng.send_to_client(self.tr, addr, MultiplexFrame.pack(sid, CMD_TCP_ACK, at, ack_seq, rh, rp, b""))
-                            
-                            ctx = StreamCtx(StreamAssembler(on_nack, on_ack))
-                            self.eng.tcp_conns[sid] = ctx
-                            asyncio.create_task(self.eng._pipe(sid, at, rh, rp, self.tr, addr))
-                        
-                        ctx = self.eng.tcp_conns.get(sid)
-                        if ctx: 
-                            ctx.last_act = time.time()
-                            ctx.assembler.receive(seq, pay)
-                    
-                    elif cmd == CMD_TCP_ACK and sid in self.eng.tcp_conns:
-                        ctx = self.eng.tcp_conns[sid]
-                        if seq > ctx.acked_seq:
-                            ctx.acked_seq = seq
-                            keys_to_del = [k for k in ctx.cache.keys() if k < seq]
-                            for k in keys_to_del: del ctx.cache[k]
-                        
-                    elif cmd == CMD_TCP_RESEND and sid in self.eng.tcp_conns:
-                        ctx = self.eng.tcp_conns[sid]
-                        ctx.last_act = time.time()
-                        if seq in ctx.cache: 
-                            self.eng.send_to_client(self.tr, addr, MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, rh, rp, ctx.cache[seq]))
-                            
-                    elif cmd == CMD_UDP_DATA:
-                        class FullConeUDPProtocol(asyncio.DatagramProtocol):
-                            def __init__(self, seng, s_id, main_tr, t_ca):
-                                self.seng = seng; self.s_id = s_id; self.main_tr = main_tr; self.t_ca = t_ca; self.tr = None
-                            def connection_made(self, tr): self.tr = tr
-                            def datagram_received(self, r_dt, r_addr):
-                                r_ip, r_port = r_addr[0], r_addr[1]; r_at = ATYP_IPV6 if ":" in r_ip else ATYP_IPV4
-                                self.seng.send_to_client(self.main_tr, self.t_ca, MultiplexFrame.pack(self.s_id, CMD_UDP_DATA, r_at, 0, r_ip, r_port, r_dt))
-                                
-                        if sid not in self.eng.udp_nat:
-                            async def create_udp():
-                                u_tr, _ = await loop.create_datagram_endpoint(lambda: FullConeUDPProtocol(self.eng, sid, self.tr, addr), local_addr=("0.0.0.0", 0))
-                                self.eng.udp_nat[sid] = (u_tr, time.time())
-                                u_tr.sendto(pay, (rh, rp))
-                            asyncio.create_task(create_udp())
-                        else:
-                            u_tr, _ = self.eng.udp_nat[sid]; self.eng.udp_nat[sid] = (u_tr, time.time())
-                            u_tr.sendto(pay, (rh, rp))
-
-                    elif cmd == CMD_TCP_CLOSE:
-                        ctx = self.eng.tcp_conns.pop(sid, None)
-                        if ctx: ctx.assembler.close()
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try: 
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8388608); sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8388608)
-        except Exception: pass
-        sock.bind((h, p))
-
-        await loop.create_datagram_endpoint(lambda: SP(self), sock=sock)
-        logging.info(f"[Server] Online at {h}:{p} | Ultra-Speed Engine Online")
+        logging.info(f"[Server] Online at {h}:{p} | 🌿 Memory Defense Engine Active")
         await asyncio.Event().wait()
 
 
@@ -781,8 +959,16 @@ def apply_resource_limits(limit_mb: int):
             soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
             target = 65535 if hard == resource.RLIM_INFINITY else hard
             resource.setrlimit(resource.RLIMIT_NOFILE, (max(target, soft), target))
-        except Exception: pass
-
+            
+            # 【修复】移除 1.2 的乘积冗余，使其严格与外部配置对齐，适配 Docker/K8s 的 Cgroup 容器限制。
+            if limit_mb > 0:
+                limit_bytes = int(limit_mb * 1024 * 1024)
+                soft_mem, hard_mem = resource.getrlimit(resource.RLIMIT_AS)
+                if hard_mem == resource.RLIM_INFINITY or limit_bytes < hard_mem:
+                    resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, hard_mem))
+                    logging.info(f"[System] Virtual memory limit (RLIMIT_AS) strictly set to {limit_mb} MB")
+        except Exception as e:
+            logging.debug(f"[System] Could not apply resource limits: {e}")
 
 def main():
     parser = argparse.ArgumentParser()
@@ -790,9 +976,7 @@ def main():
     args = parser.parse_args()
     if not os.path.exists(args.config): sys.exit(1)
         
-    with open(args.config, "r", encoding="utf-8") as f: 
-        config = yaml.safe_load(f)
-    
+    with open(args.config, "r", encoding="utf-8") as f: config = yaml.safe_load(f)
     logging.basicConfig(level=getattr(logging, config.get("log_level", "info").upper(), logging.INFO), format="%(asctime)s [%(levelname)s] %(message)s")
     
     try: 
@@ -800,14 +984,11 @@ def main():
         logging.info("[System] uvloop active")
     except ImportError: pass
     
-    apply_resource_limits(config.get("memory_limit_mb", 256))
+    apply_resource_limits(config.get("available_memory_mb", 512))
     loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
     
     role = config.get("role", "client").lower()
-    try: 
-        if role == "client": loop.run_until_complete(ClientEngine(config).start())
-        else: loop.run_until_complete(ServerEngine(config).start())
+    try: loop.run_until_complete(ClientEngine(config).start() if role == "client" else ServerEngine(config).start())
     except KeyboardInterrupt: pass
 
-if __name__ == "__main__": 
-    main()
+if __name__ == "__main__": main()

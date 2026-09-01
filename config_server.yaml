@@ -1,14 +1,28 @@
-# Lightcone Tunnel v1.2.0 - Server Configuration
+# Lightcone Tunnel v4.2.2 - Server Configuration
+# Production Release: Memory-Aware Adaptive Engine & Strict Defenses
 
 role: "server"                     # Node operation mode: "client" or "server"
 server_addr: "0.0.0.0:9999"        # UDP listening host and port
 psk: "YourStrongSecretPSKKeyHere"  # Pre-shared key (must match client's PSK exactly)
 
-# RS-FEC (Reed-Solomon Forward Error Correction) Settings
-# Must match client settings for successful payload reconstruction.
+# ============================================================================
+# Memory & Latency Adaptive Engine
+# ============================================================================
+# The engine dynamically calculates TCP/UDP buffer sizes, timeouts, and scan windows based on these two core metrics.
+available_memory_mb: 512           # Max memory limit in MB. Aligns with cgroup/Docker limits to prevent OOM. (Default: 512)
+expected_latency_ms: 100           # Expected RTT latency to clients in ms. Used to tune NACK/FEC timeouts. (Default: 100)
+
+# Optional: Hard limit for concurrent outbound sockets and Full-Cone NAT entries.
+# Note: If set higher than the memory-derived limit, the engine will safely downscale per-stream buffer sizes to prevent OOM.
+max_concurrent_streams: 1024       
+
+# ============================================================================
+# RS-FEC (Forward Error Correction) Settings
+# ============================================================================
+# Set both to 0 to disable FEC. Both client and server MUST use identical N/M settings.
+# Note: v4.2.2 supports zfec status negotiation. It safely drops packets if zfec is missing locally but used by the peer.
 fec_data_shards: 12                # Number of data shards (N)
 fec_parity_shards: 4               # Number of parity shards (M)
 
-# System Performance & Safety Limits
-max_concurrent_streams: 1024       # Limit for concurrent outbound sockets and Full-Cone NAT entries
+# System Settings
 log_level: "info"                  # Log verbosity: "debug", "info", "warning", "error"
