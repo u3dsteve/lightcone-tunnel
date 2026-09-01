@@ -2,7 +2,7 @@
 """
 Lightcone Tunnel - High-Performance Anti-DPI UDP Tunnel & Proxy Solution
 Single-file executable supporting Client (SOCKS5/HTTP Proxy) & Server (Full-Cone NAT Forwarder)
-Production Release v1.2.2 (Added StreamAssembler, Seq Ordering & Fixed TCP Blackhole)
+Production Release v1.2.3 (Added NAT Keep-Alive Heartbeat, StreamAssembler & Fixed TCP Blackhole)
 """
 
 import argparse
@@ -34,6 +34,7 @@ except ImportError:
 CMD_TCP_DATA  = 0x01
 CMD_TCP_CLOSE = 0x02
 CMD_UDP_DATA  = 0x03
+CMD_HEARTBEAT = 0x04           # NAT Keep-alive heartbeat
 
 ATYP_IPV4   = 0x01
 ATYP_DOMAIN = 0x03
@@ -43,6 +44,7 @@ MAX_PAYLOAD_SIZE = 1000        # Shrink to 1000 to prevent UDP MTU IP fragmentat
 TIMESTAMP_TOLERANCE_SEC = 30.0 # Time sync window tolerance
 IDLE_TIMEOUT_SEC = 300.0       # Resource auto-reclamation timeout (5 mins)
 CONNECT_TIMEOUT_SEC = 10.0     # Connection timeout to prevent infinite wait trap
+HEARTBEAT_INTERVAL_SEC = 20.0  # NAT Keep-alive interval (prevent router NAT expiration)
 DEFAULT_MAX_CONCURRENT_STREAMS = 1024 # Default fallback application rate-limiting threshold
 
 BURST_PACKET_COUNT = 12        # Send N packets continuously before applying micro-sleep
@@ -370,6 +372,18 @@ class ClientEngine:
                 logging.debug(f"[DDNS] Current server IP: {self.server_ip}")
             await asyncio.sleep(60)
 
+    async def heartbeat_loop(self):
+        """Periodically ping the server to keep the router's NAT UDP mapping alive."""
+        while True:
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+            if self.server_ip and self.transport:
+                try:
+                    # stream_id=0, seq=0, host="0.0.0.0", port=0
+                    frame = MultiplexFrame.pack(0, CMD_HEARTBEAT, ATYP_IPV4, 0, "0.0.0.0", 0, b"")
+                    self.send_to_server(frame)
+                except Exception as e:
+                    logging.debug(f"[Heartbeat] Error: {e}")
+
     async def cleanup_idle_loop(self):
         while True:
             await asyncio.sleep(30)
@@ -688,6 +702,7 @@ class ClientEngine:
         await self.resolve_ddns_once()
         asyncio.create_task(self.resolve_ddns())
         asyncio.create_task(self.cleanup_idle_loop())
+        asyncio.create_task(self.heartbeat_loop())  # Start heartbeat
 
         class ClientUDPProtocol(asyncio.DatagramProtocol):
             def __init__(self, client_engine):
@@ -734,6 +749,9 @@ class ClientEngine:
                         conn = self.engine.streams.pop(stream_id, None)
                         if conn:
                             conn[0].close()
+                    
+                    elif cmd == CMD_HEARTBEAT:
+                        pass  # Ignored on purpose
 
         transport, _ = await loop.create_datagram_endpoint(
             lambda: ClientUDPProtocol(self), local_addr=("0.0.0.0", 0)
@@ -957,6 +975,8 @@ class ServerEngine:
                         conn = self.engine.tcp_connections.pop(stream_id, None)
                         if conn:
                             conn[0].close()
+                    elif cmd == CMD_HEARTBEAT:
+                        pass  # NAT Keep-alive registered automatically by reaching here
 
         transport, _ = await loop.create_datagram_endpoint(
             lambda: ServerUDPProtocol(self), local_addr=(host, port)
