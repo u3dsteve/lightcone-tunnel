@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Lightcone Tunnel - High-Performance Anti-DPI UDP Tunnel & Proxy Solution
-Production Release v4.2.8 (Congestion Control Optimized with RTT)
 """
 
 import argparse
@@ -100,21 +99,25 @@ class StreamCtx:
         self.assembler = assembler
         self.resend_data_cb = resend_data_cb
         self.last_act = time.time()
-        # 缓存格式修改为 seq -> (payload, send_time)
+        # Cache format: seq -> (payload, send_time)
         self.cache = {}
         self.acked_seq = 0
         self.mem = mem
         
-        # 拥塞控制参数
-        self.cwnd = 1024.0                     # 初始窗口增大
+        # Congestion control parameters
+        self.cwnd = 32.0  # [FIX] Start with a reasonable window to avoid bufferbloat
         self.ssthresh = float(mem.max_window_packets)
         self.last_loss_time = 0
         self.last_ack_advance_time = time.time()
         self.last_stall_probe = 0
         
-        # RTT 估计
-        self.rtt_estimate = 0.1                # 初始 RTT 100ms
-        self.rtt_alpha = 0.125                 # EWMA 系数
+        # RTT estimation
+        self.rtt_estimate = 0.1
+        self.rtt_alpha = 0.125
+        
+        # [FIX] Event-driven backpressure mechanism for flow control
+        self.window_event = asyncio.Event()
+        self.window_event.set()
 
 
 # ============================================================================
@@ -174,6 +177,9 @@ class FECGroupEncoder:
         if self.m > 127:
             logging.warning(f"[FEC] Parity shards {self.m} exceeds 127, capping to 127.")
             self.m = 127
+        if not zfec and self.m > 1:
+            logging.warning("[FEC] zfec module missing. Capping parity shards to 1 for XOR fallback.")
+            self.m = 1
         self.mem = mem
         self.group_id = 0
         self.buffer = []
@@ -500,7 +506,7 @@ class LightconeEngineBase:
 
     async def active_arq_sweep(self, stream_dict: dict):
         while True:
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.5) # [FIX] Reduced frequency to save CPU
             now = time.time()
             
             if getattr(self, "fec_enabled", False):
@@ -550,17 +556,15 @@ class LightconeEngineBase:
 
                 local_buf = asm.writer.transport.get_write_buffer_size() if asm.writer and hasattr(asm.writer, 'transport') else 0
                 if asm.unacked_count > 0 and local_buf < self.mem.tcp_buf_limit:
-                    # 提高 ACK 频率：0.05s 或 4 个包
                     if (now - asm.last_ack_time > 0.05) or (asm.unacked_count >= 4):
                         if asm.ack_callback: asm.ack_callback(asm.expected_seq)
                         asm.unacked_count = 0
                         asm.last_ack_time = now
 
-                # 保留重传逻辑，间隔不变
                 if ctx.cache and (now - ctx.last_ack_advance_time > 2.0):
                     ctx.last_ack_advance_time = now
                     if ctx.acked_seq in ctx.cache and getattr(ctx, 'resend_data_cb', None):
-                        ctx.resend_data_cb(ctx.acked_seq, ctx.cache[ctx.acked_seq][0])  # 注意取出 payload
+                        ctx.resend_data_cb(ctx.acked_seq, ctx.cache[ctx.acked_seq][0])
 
 
 class ClientEngine(LightconeEngineBase):
@@ -642,41 +646,43 @@ class ClientEngine(LightconeEngineBase):
                             now = time.time()
                             if seq > ctx.acked_seq:
                                 acked_count = seq - ctx.acked_seq
-                                # 更新 RTT（如果有对应的发送时间）
                                 for ack_seq in range(ctx.acked_seq, seq):
                                     if ack_seq in ctx.cache:
                                         send_time = ctx.cache[ack_seq][1]
-                                        rtt = now - send_time
-                                        if rtt > 0:
-                                            # 使用 EWMA 更新 RTT 估计
-                                            ctx.rtt_estimate = (1 - ctx.rtt_alpha) * ctx.rtt_estimate + ctx.rtt_alpha * rtt
+                                        # [FIX] Karn's algorithm: Ignore packets marked as resent (time == 0)
+                                        if send_time > 0:
+                                            rtt = now - send_time
+                                            if rtt > 0:
+                                                ctx.rtt_estimate = (1 - ctx.rtt_alpha) * ctx.rtt_estimate + ctx.rtt_alpha * rtt
                                 ctx.acked_seq = seq
                                 ctx.last_ack_advance_time = now
                                 
-                                # 窗口增长优化：慢启动 *2，拥塞避免 *1
                                 if ctx.cwnd < ctx.ssthresh:
                                     ctx.cwnd += acked_count * 2
                                 else:
                                     ctx.cwnd += acked_count
                                 ctx.cwnd = min(ctx.cwnd, float(self.mem.max_window_packets))
                                 
-                                # 清理已确认的缓存
                                 keys_to_del = [k for k in ctx.cache.keys() if k < seq]
                                 for k in keys_to_del:
                                     del ctx.cache[k]
+                                
+                                # [FIX] Wake up waiting tasks now that window has space
+                                ctx.window_event.set()
                                 
                         elif cmd == CMD_TCP_RESEND and sid in self.streams:
                             ctx = self.streams[sid]
                             ctx.last_act = time.time()
                             now = time.time()
                             if now - ctx.last_loss_time > 0.5:
-                                # 发生丢包，调整 ssthresh 和 cwnd
                                 ctx.ssthresh = max(int(ctx.cwnd * 0.8), 256)
                                 ctx.cwnd = ctx.ssthresh
                                 ctx.last_loss_time = now
                             if seq in ctx.cache:
-                                # 重传时取出 payload（第一个元素）
-                                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, rh, rp, ctx.cache[seq][0]), (self.s_ip, self.s_port))
+                                payload, _ = ctx.cache[seq]
+                                # [FIX] Karn's algorithm: Mark packet as resent (time = 0)
+                                ctx.cache[seq] = (payload, 0)
+                                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, rh, rp, payload), (self.s_ip, self.s_port))
                                 
                         elif cmd == CMD_UDP_DATA and sid in self.udp_sessions:
                             ca, ut, _ = self.udp_sessions[sid]
@@ -745,21 +751,22 @@ class ClientEngine(LightconeEngineBase):
                         
                         for i in range(0, len(data), MAX_PAYLOAD_SIZE):
                             chunk = data[i:i+MAX_PAYLOAD_SIZE]
-                            while seq - ctx.acked_seq > int(ctx.cwnd):
+                            
+                            # [FIX] Replaced CPU-intensive busy-waiting with Event backpressure
+                            while seq - ctx.acked_seq >= int(ctx.cwnd):
                                 if ctx.assembler.is_broken or sid not in self.streams: break
-                                await asyncio.sleep(0.001)  # 降低等待间隔
-                                if time.time() - ctx.last_stall_probe > 0.2:
+                                ctx.window_event.clear()
+                                try:
+                                    await asyncio.wait_for(ctx.window_event.wait(), timeout=0.2)
+                                except asyncio.TimeoutError:
                                     ctx.last_stall_probe = time.time()
                                     if ctx.acked_seq in ctx.cache:
                                         self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, ctx.acked_seq, host, port, ctx.cache[ctx.acked_seq][0]), (self.s_ip, self.s_port))
 
                             if ctx.assembler.is_broken or sid not in self.streams: break
-                            # 存储 payload 和发送时间戳
+                            
                             ctx.cache[seq] = (chunk, time.time())
-                            if len(ctx.cache) > self.mem.max_window_packets:
-                                # 删除最旧的未确认包
-                                oldest_seq = min(ctx.cache.keys())
-                                del ctx.cache[oldest_seq]
+                            # [FIX] Removed destructive cache deletion that breaks ARQ
                             
                             self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, chunk), (self.s_ip, self.s_port))
                             seq += 1
@@ -769,6 +776,11 @@ class ClientEngine(LightconeEngineBase):
                         logging.error("[Defense] MemoryError during Client TCP Read! Dropping chunk.")
                         gc.collect()
                         await asyncio.sleep(0.1)
+
+                # [FIX] Graceful shutdown (Half-Close): Drain ARQ buffer before exiting
+                drain_start = time.time()
+                while ctx.cache and not ctx.assembler.is_broken and (time.time() - drain_start < 5.0):
+                    await asyncio.sleep(0.05)
 
             elif cmd == 0x03:
                 if len(self.udp_sessions) >= self.mem.max_streams: writer.close(); return
@@ -839,7 +851,6 @@ class ClientEngine(LightconeEngineBase):
             ctx = StreamCtx(StreamAssembler(self.mem, on_nack, on_ack), self.mem, resend_data_cb=on_resend)
             ctx.assembler.set_writer(writer); self.streams[sid] = ctx
             if method != "CONNECT":
-                # 存储已发送的初始请求行
                 ctx.cache[0] = (line, time.time())
             
             while True:
@@ -849,22 +860,29 @@ class ClientEngine(LightconeEngineBase):
                 
                 for i in range(0, len(data), MAX_PAYLOAD_SIZE):
                     chunk = data[i:i+MAX_PAYLOAD_SIZE]
-                    while seq - ctx.acked_seq > int(ctx.cwnd):
+                    
+                    # [FIX] Replaced CPU-intensive busy-waiting with Event backpressure
+                    while seq - ctx.acked_seq >= int(ctx.cwnd):
                         if ctx.assembler.is_broken or sid not in self.streams: break
-                        await asyncio.sleep(0.001)
-                        if time.time() - ctx.last_stall_probe > 0.2:
+                        ctx.window_event.clear()
+                        try:
+                            await asyncio.wait_for(ctx.window_event.wait(), timeout=0.2)
+                        except asyncio.TimeoutError:
                             ctx.last_stall_probe = time.time()
                             if ctx.acked_seq in ctx.cache:
                                 self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, ctx.acked_seq, host, port, ctx.cache[ctx.acked_seq][0]), (self.s_ip, self.s_port))
 
                     if ctx.assembler.is_broken or sid not in self.streams: break
                     ctx.cache[seq] = (chunk, time.time())
-                    if len(ctx.cache) > self.mem.max_window_packets:
-                        oldest_seq = min(ctx.cache.keys())
-                        del ctx.cache[oldest_seq]
+                    # [FIX] Removed destructive cache deletion that breaks ARQ
                     
                     self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, atyp, seq, host, port, chunk), (self.s_ip, self.s_port))
                     seq += 1
+
+            # [FIX] Graceful shutdown (Half-Close): Drain ARQ buffer before exiting
+            drain_start = time.time()
+            while ctx.cache and not ctx.assembler.is_broken and (time.time() - drain_start < 5.0):
+                await asyncio.sleep(0.05)
 
         except (ConnectionError, asyncio.IncompleteReadError): pass
         except Exception as e:
@@ -972,9 +990,11 @@ class ServerEngine(LightconeEngineBase):
                                 for ack_seq in range(ctx.acked_seq, seq):
                                     if ack_seq in ctx.cache:
                                         send_time = ctx.cache[ack_seq][1]
-                                        rtt = now - send_time
-                                        if rtt > 0:
-                                            ctx.rtt_estimate = (1 - ctx.rtt_alpha) * ctx.rtt_estimate + ctx.rtt_alpha * rtt
+                                        # [FIX] Karn's algorithm applied here too
+                                        if send_time > 0:
+                                            rtt = now - send_time
+                                            if rtt > 0:
+                                                ctx.rtt_estimate = (1 - ctx.rtt_alpha) * ctx.rtt_estimate + ctx.rtt_alpha * rtt
                                 ctx.acked_seq = seq
                                 ctx.last_ack_advance_time = now
                                 
@@ -987,6 +1007,9 @@ class ServerEngine(LightconeEngineBase):
                                 keys_to_del = [k for k in ctx.cache.keys() if k < seq]
                                 for k in keys_to_del:
                                     del ctx.cache[k]
+                                
+                                # [FIX] Wake up waiting tasks now that window has space
+                                ctx.window_event.set()
                             
                         elif cmd == CMD_TCP_RESEND and sid in self.tcp_conns:
                             ctx = self.tcp_conns[sid]
@@ -997,7 +1020,10 @@ class ServerEngine(LightconeEngineBase):
                                 ctx.cwnd = ctx.ssthresh
                                 ctx.last_loss_time = now
                             if seq in ctx.cache:
-                                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, rh, rp, ctx.cache[seq][0]), addr)
+                                payload, _ = ctx.cache[seq]
+                                # [FIX] Karn's algorithm: Mark packet as resent (time = 0)
+                                ctx.cache[seq] = (payload, 0)
+                                self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, rh, rp, payload), addr)
                                 
                         elif cmd == CMD_UDP_DATA:
                             if sid not in self.udp_nat:
@@ -1072,24 +1098,31 @@ class ServerEngine(LightconeEngineBase):
                 
                 for i in range(0, len(data), MAX_PAYLOAD_SIZE):
                     chunk = data[i:i+MAX_PAYLOAD_SIZE]
-                    while seq - ctx.acked_seq > int(ctx.cwnd):
+                    
+                    # [FIX] Replaced CPU-intensive busy-waiting with Event backpressure
+                    while seq - ctx.acked_seq >= int(ctx.cwnd):
                         if ctx.assembler.is_broken or sid not in self.tcp_conns: break
-                        await asyncio.sleep(0.001)
-                        if time.time() - ctx.last_stall_probe > 0.2:
+                        ctx.window_event.clear()
+                        try:
+                            await asyncio.wait_for(ctx.window_event.wait(), timeout=0.2)
+                        except asyncio.TimeoutError:
                             ctx.last_stall_probe = time.time()
                             if ctx.acked_seq in ctx.cache:
                                 self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, ctx.acked_seq, h, p, ctx.cache[ctx.acked_seq][0]), ca)
 
                     if ctx.assembler.is_broken or sid not in self.tcp_conns: break
                     ctx.cache[seq] = (chunk, time.time())
-                    if len(ctx.cache) > self.mem.max_window_packets:
-                        oldest_seq = min(ctx.cache.keys())
-                        del ctx.cache[oldest_seq]
+                    # [FIX] Removed destructive cache deletion that breaks ARQ
                     
                     self._direct_send(MultiplexFrame.pack(sid, CMD_TCP_DATA, at, seq, h, p, chunk), ca)
                     seq += 1
                     pkt_cnt += 1
                     if pkt_cnt % 64 == 0: await asyncio.sleep(0)
+
+            # [FIX] Graceful shutdown (Half-Close): Drain ARQ buffer before exiting
+            drain_start = time.time()
+            while ctx.cache and not ctx.assembler.is_broken and (time.time() - drain_start < 5.0):
+                await asyncio.sleep(0.05)
                     
         except MemoryError:
             logging.error("[Defense] MemoryError during Server TCP Read! Dropping chunk.")
