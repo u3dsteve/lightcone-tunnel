@@ -3,8 +3,6 @@
 
 """
 Lightcone Manager - GUI Console for Lightcone Tunnel
-Version: 1.4.4
-Framework: NiceGUI (Material You / M3 Expressive Theme)
 """
 
 import os
