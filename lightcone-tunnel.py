@@ -115,6 +115,7 @@ ARQ_SWEEP_INTERVAL = 0.1        # per-stream ARQ / ACK servicing
 FEC_FLUSH_INTERVAL = 0.05       # partial-group flush cadence
 ACK_BATCH_THRESHOLD = 4         # immediate ACK after this many packets
 ADDR_CACHE_SIZE = 4096          # upper bound on the encoded-address cache
+READ_BATCH_LIMIT = 200          # packets per _read_from_os invocation
 
 
 # ============================================================================
@@ -741,17 +742,28 @@ class LightconeEngineBase:
                     stream_dict.pop(sid, None)
 
             for sid, ctx in list(stream_dict.items()):
-                if now - ctx.last_act > self.mem.idle_timeout:
-                    ctx.assembler.close()
+                age = now - ctx.last_act
+                asm = ctx.assembler
+
+                # [FIX] Fast path for quiescent streams. A stream that has
+                # no ARQ cache, no reorder buffer, and no unacknowledged
+                # packets has nothing to do except expire eventually. Skip
+                # the rest of the loop body without touching other fields.
+                if (age > 1.0
+                        and not ctx.cache
+                        and not asm.buffer
+                        and asm.unacked_count == 0):
+                    if age > self.mem.idle_timeout:
+                        asm.close()
+                        stream_dict.pop(sid, None)
+                    continue
+
+                if age > self.mem.idle_timeout:
+                    asm.close()
                     stream_dict.pop(sid, None)
                     continue
 
-                asm = ctx.assembler
                 if asm.is_broken:
-                    continue
-
-                is_idle = (now - ctx.last_act > 1.0)
-                if is_idle and not asm.buffer and asm.unacked_count == 0 and not ctx.cache:
                     continue
 
                 if asm.buffer:
@@ -852,7 +864,12 @@ class ClientEngine(LightconeEngineBase):
     def _read_from_os(self):
         try:
             processed = 0
-            while True:
+            # [FIX] Bounded read loop. We return without rescheduling when we
+            # hit the batch limit and let epoll re-invoke us on the next
+            # iteration. add_reader is level-triggered, so pending data in
+            # the socket buffer guarantees another callback without an
+            # explicit call_soon() round trip.
+            while processed < READ_BATCH_LIMIT:
                 try:
                     data, addr = self.sock.recvfrom(65536)
                     for dpkt in self.fec_decoder.process_datagram(addr, data, self.fec_enabled):
@@ -937,10 +954,6 @@ class ClientEngine(LightconeEngineBase):
                                 ctx.assembler.close()
 
                     processed += 1
-                    if processed >= 200:
-                        loop = asyncio.get_running_loop()
-                        loop.call_soon(self._read_from_os)
-                        return
                 except BlockingIOError:
                     break
                 except ConnectionResetError:
@@ -1305,7 +1318,12 @@ class ServerEngine(LightconeEngineBase):
     def _read_from_os(self):
         try:
             processed = 0
-            while True:
+            # [FIX] Bounded read loop. We return without rescheduling when we
+            # hit the batch limit and let epoll re-invoke us on the next
+            # iteration. add_reader is level-triggered, so pending data in
+            # the socket buffer guarantees another callback without an
+            # explicit call_soon() round trip.
+            while processed < READ_BATCH_LIMIT:
                 try:
                     data, addr = self.sock.recvfrom(65536)
                     for dpkt in self.fec_decoder.process_datagram(addr, data, getattr(self, "fec_enabled", False)):
@@ -1435,10 +1453,6 @@ class ServerEngine(LightconeEngineBase):
                                 ctx.assembler.close()
 
                     processed += 1
-                    if processed >= 200:
-                        loop = asyncio.get_running_loop()
-                        loop.call_soon(self._read_from_os)
-                        return
                 except BlockingIOError:
                     break
                 except ConnectionResetError:
